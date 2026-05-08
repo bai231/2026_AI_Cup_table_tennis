@@ -20,6 +20,7 @@
 ├── quick_tune.py             # 自動測試不同參數組合的程式
 ├── train.csv                 # 訓練資料
 ├── test.csv                  # 測試資料
+├── test_new.csv              # 新增測試資料
 ├── sample_submission.csv     # submission 格式範例
 ├── submission_lstm_baseline.csv # 預測輸出檔
 ├── README.md

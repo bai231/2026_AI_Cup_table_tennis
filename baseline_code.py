@@ -114,31 +114,47 @@ def main(args):
 
     train = pd.read_csv(args.train).sort_values(["rally_uid", "strikeNumber"])
     test  = pd.read_csv(args.test).sort_values(["rally_uid", "strikeNumber"])
-    sub   = pd.read_csv(args.sample)
 
     print("train shape:", train.shape)
     print("test shape:", test.shape)
-    print("sample shape:", sub.shape)
 
     # 把每回合球數限制在某個區段
     train["strikeNumber"] = train["strikeNumber"].clip(0, 40)
     test["strikeNumber"]  = test["strikeNumber"].clip(0, 40)
 
     # 把資料換成統一編碼
-    cats = {c: pd.Categorical(train[c]).categories for c in FEATURES}
+    # 0 保留給 padding。
+    # 1 ~ len(cats[col]) 給 train 看過的類別。
+    # len(cats[col]) + 1 給 test 可能出現但 train 沒看過的未知類別。
+    # 不再用 pd.Categorical(df[col], categories=...)，避免新版 pandas 對未知類別產生 Pandas4Warning。
+    cats = {
+        c: np.sort(train[c].dropna().unique())
+        for c in FEATURES
+    }
+
+    cat_maps = {
+        c: {v: i + 1 for i, v in enumerate(cats[c])}
+        for c in FEATURES
+    }
+
+    unk_tokens = {
+        c: len(cats[c]) + 1
+        for c in FEATURES
+    }
 
     def encode_frame(df):
         outs = []
 
         for col in FEATURES:
-            raw_codes = pd.Categorical(df[col], categories=cats[col]).codes
+            codes = (
+                df[col]
+                .map(cat_maps[col])
+                .fillna(unk_tokens[col])
+                .astype(np.int64)
+                .to_numpy()
+            )
 
-            # 0 保留給 padding
-            # 1 ~ len(cats[col]) 給 train 看過的類別
-            # len(cats[col]) + 1 給 test 可能出現但 train 沒看過的未知類別
-            codes = np.where(raw_codes < 0, len(cats[col]) + 1, raw_codes + 1)
-
-            outs.append(np.asarray(codes, dtype=np.int64))
+            outs.append(codes)
 
         return np.stack(outs, axis=1)
 
@@ -408,20 +424,18 @@ def main(args):
     # 輸出
     pred_df = pd.DataFrame(pred_rows)
 
-    out = pd.read_csv(args.sample).drop(
-        columns=["actionId", "pointId", "serverGetPoint"],
-        errors="ignore"
-    )
-
-    out = out.merge(pred_df, on="rally_uid", how="left")
-
     column_order = ["rally_uid", "actionId", "pointId", "serverGetPoint"]
-    out = out[column_order]
 
+    out = pred_df[column_order].copy()
     out = out.sort_values("rally_uid")
+
+    if out[column_order].isna().any().any():
+        print("WARNING: submission 裡面有 NaN，請檢查預測結果。")
+
     out.to_csv(args.out, index=False)
 
     print(f"Saved submission to: {args.out}")
+    print("submission shape:", out.shape)
     print(out.head())
 
 
@@ -429,7 +443,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--train", default="train.csv")
-    ap.add_argument("--test", default="test.csv")
+    ap.add_argument("--test", default="test_new.csv")
+    # 保留 --sample 只是為了相容舊指令；目前輸出直接使用 test 的 rally_uid，不再讀 sample_submission.csv。
     ap.add_argument("--sample", default="sample_submission.csv")
     ap.add_argument("--out", default="submission_lstm_baseline.csv")
 

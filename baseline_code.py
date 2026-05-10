@@ -20,6 +20,7 @@ FEATURES = [
 ]
 
 PAD_TOKEN = 0
+ACTION_FEATURE_IDX = FEATURES.index("actionId")
 
 
 # 把資料轉成可以用的格式
@@ -39,6 +40,16 @@ class RallyDataset(Dataset):
 
 
 class MultiTaskLSTM(nn.Module):
+    """
+    V1.6: original single-direction LSTM baseline + Action Transition Head.
+
+    Main idea:
+    - Keep the original LSTM backbone unchanged.
+    - Add a small shortcut from current actionId token to next-action logits.
+    - Final action logits = LSTM action logits + learned transition bias.
+
+    This targets ActionId Prediction while keeping pointId/serverGetPoint behavior close to V1.5.
+    """
     def __init__(self, num_tokens_per_feature, n_act, n_pt, emb_dim=16, hidden=128, num_layers=1, dropout=0.2):
         super().__init__()
 
@@ -57,9 +68,25 @@ class MultiTaskLSTM(nn.Module):
         )
 
         self.drop = nn.Dropout(dropout)
+
+        # Keep original heads.
         self.act_head = nn.Linear(hidden, n_act)
         self.pt_head  = nn.Linear(hidden, n_pt)
         self.rly_head = nn.Linear(hidden, 1)
+
+        # V1.6: current actionId token -> next actionId logits.
+        # num_tokens_per_feature already contains the unknown-token id as max token id.
+        self.act_transition = nn.Embedding(
+            num_tokens_per_feature[ACTION_FEATURE_IDX] + 1,
+            n_act,
+            padding_idx=PAD_TOKEN
+        )
+
+        # Start from the original baseline behavior.
+        nn.init.zeros_(self.act_transition.weight)
+
+        # Learn how much the transition shortcut should affect action logits.
+        self.transition_scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, X, lengths):
         es = [emb(X[:, :, i]) for i, emb in enumerate(self.embs)]
@@ -82,11 +109,23 @@ class MultiTaskLSTM(nn.Module):
 
         o = self.drop(o)
 
+        # Original LSTM action logits.
+        act_logits = self.act_head(o)
+
+        # Action transition shortcut.
+        cur_action_token = X[:, :, ACTION_FEATURE_IDX]
+        trans_logits = self.act_transition(cur_action_token)
+        act_logits = act_logits + self.transition_scale * trans_logits
+
+        pt_logits = self.pt_head(o)
+
         mask = (X[:, :, 0] != PAD_TOKEN).float().unsqueeze(-1)
         denom = mask.sum(dim=1).clamp(min=1.0)
         mean_hidden = (o * mask).sum(dim=1) / denom
 
-        return self.act_head(o), self.pt_head(o), self.rly_head(mean_hidden).squeeze(1)
+        rally_logits = self.rly_head(mean_hidden).squeeze(1)
+
+        return act_logits, pt_logits, rally_logits
 
 
 def pad2d(a, m, pad_val=PAD_TOKEN):
@@ -245,6 +284,8 @@ def main(args):
     num_tokens_per_feature = [len(cats[c]) + 1 for c in FEATURES]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device:", device)
+    print("model: MultiTaskLSTM V1.6 transition (original LSTM + Action Transition Head + adjustable loss weights)")
 
     model = MultiTaskLSTM(
         num_tokens_per_feature,
@@ -260,12 +301,60 @@ def main(args):
     ce_point  = nn.CrossEntropyLoss(ignore_index=-1, weight=pt_w.to(device))
     bce_rally = nn.BCEWithLogitsLoss()
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.weight_decay > 0:
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay
+        )
+    else:
+        # weight_decay=0 時使用原本 baseline 的 Adam，方便做公平對照。
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # 保存 validation Final~ 最好的 epoch
+    total_w = args.action_w + args.point_w + args.rally_w
+    if total_w <= 0:
+        raise ValueError("action_w + point_w + rally_w must be positive")
+    if not (0.0 <= args.last_action_w <= 1.0):
+        raise ValueError("last_action_w must be between 0 and 1")
+
+    action_loss_w = args.action_w / total_w
+    point_loss_w = args.point_w / total_w
+    rally_loss_w = args.rally_w / total_w
+
+    print(
+        f"loss weights: action={action_loss_w:.3f}, "
+        f"point={point_loss_w:.3f}, rally={rally_loss_w:.3f}"
+    )
+    print(f"last_action_w={args.last_action_w:.3f}, select_metric={args.select_metric}")
+
+    def compute_action_loss(logits, targets, lengths):
+        """Action loss over all valid timesteps, optionally mixed with last-timestep action loss."""
+        action_loss_all = ce_action(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1)
+        )
+
+        if args.last_action_w <= 0:
+            return action_loss_all
+
+        bidx = torch.arange(targets.size(0), device=targets.device)
+        last_pos = (lengths - 1).clamp(min=0)
+        action_loss_last = ce_action(
+            logits[bidx, last_pos],
+            targets[bidx, last_pos]
+        )
+
+        return (
+            (1.0 - args.last_action_w) * action_loss_all
+            + args.last_action_w * action_loss_last
+        )
+
+    # 保存 validation 最佳 epoch。預設仍用官方近似 Final~；可改用 action/action_last 選模型。
+    best_score = -1.0
     best_final = -1.0
     best_epoch = 0
     best_state = None
+    best_metrics = {"f1_action": 0.0, "f1_action_last": 0.0, "f1_point": 0.0, "auc": 0.5}
     bad_epochs = 0
 
     for ep in range(1, args.epochs + 1):
@@ -284,10 +373,14 @@ def main(args):
 
             la, lp, lr = model(Xb, Lb)
 
+            action_loss = compute_action_loss(la, yAb, Lb)
+            point_loss = ce_point(lp.reshape(-1, lp.size(-1)), yPb.reshape(-1))
+            rally_loss = bce_rally(lr, yRb)
+
             loss = (
-                0.4 * ce_action(la.view(-1, la.size(-1)), yAb.view(-1))
-                + 0.4 * ce_point(lp.view(-1, lp.size(-1)), yPb.view(-1))
-                + 0.2 * bce_rally(lr, yRb)
+                action_loss_w * action_loss
+                + point_loss_w * point_loss
+                + rally_loss_w * rally_loss
             )
 
             loss.backward()
@@ -301,6 +394,7 @@ def main(args):
         val_loss = 0.0
 
         allA, allAp = [], []
+        allA_last, allAp_last = [], []
         allP, allPp = [], []
         allR, allRp = [], []
 
@@ -314,10 +408,14 @@ def main(args):
 
                 la, lp, lr = model(Xb, Lb)
 
+                action_loss = compute_action_loss(la, yAb, Lb)
+                point_loss = ce_point(lp.reshape(-1, lp.size(-1)), yPb.reshape(-1))
+                rally_loss = bce_rally(lr, yRb)
+
                 loss = (
-                    0.4 * ce_action(la.view(-1, la.size(-1)), yAb.view(-1))
-                    + 0.4 * ce_point(lp.view(-1, lp.size(-1)), yPb.view(-1))
-                    + 0.2 * bce_rally(lr, yRb)
+                    0.4 * action_loss
+                    + 0.4 * point_loss
+                    + 0.2 * rally_loss
                 )
 
                 val_loss += loss.item() * Xb.size(0)
@@ -325,17 +423,25 @@ def main(args):
                 allR += yRb.detach().cpu().tolist()
                 allRp += torch.sigmoid(lr).detach().cpu().tolist()
 
-                yA_flat = yAb.view(-1).detach().cpu().numpy()
-                yP_flat = yPb.view(-1).detach().cpu().numpy()
+                yA_flat = yAb.reshape(-1).detach().cpu().numpy()
+                yP_flat = yPb.reshape(-1).detach().cpu().numpy()
 
-                a_pred = la.argmax(-1).view(-1).detach().cpu().numpy()
-                p_pred = lp.argmax(-1).view(-1).detach().cpu().numpy()
+                a_pred = la.argmax(-1).reshape(-1).detach().cpu().numpy()
+                p_pred = lp.argmax(-1).reshape(-1).detach().cpu().numpy()
 
                 mA = (yA_flat != -1)
                 mP = (yP_flat != -1)
 
                 allA += yA_flat[mA].tolist()
                 allAp += a_pred[mA].tolist()
+
+                bidx = torch.arange(Xb.size(0), device=device)
+                last_pos = (Lb - 1).clamp(min=0)
+                a_last_true = yAb[bidx, last_pos].detach().cpu().numpy()
+                a_last_pred = la[bidx, last_pos].argmax(-1).detach().cpu().numpy()
+                mA_last = (a_last_true != -1)
+                allA_last += a_last_true[mA_last].tolist()
+                allAp_last += a_last_pred[mA_last].tolist()
 
                 allP += yP_flat[mP].tolist()
                 allPp += p_pred[mP].tolist()
@@ -345,25 +451,42 @@ def main(args):
 
         try:
             f1A = f1_score(allA, allAp, average="macro") if len(allA) else 0.0
+            f1A_last = f1_score(allA_last, allAp_last, average="macro") if len(allA_last) else 0.0
             f1P = f1_score(allP, allPp, average="macro") if len(allP) else 0.0
             auc = roc_auc_score(allR, allRp) if len(set(allR)) > 1 else 0.5
         except Exception:
-            f1A, f1P, auc = 0.0, 0.0, 0.5
+            f1A, f1A_last, f1P, auc = 0.0, 0.0, 0.0, 0.5
 
         final = 0.4 * f1A + 0.4 * f1P + 0.2 * auc
 
         print(
             f"[Epoch {ep}/{args.epochs}] "
             f"train_loss={tr_loss:.4f} val_loss={va_loss:.4f} "
-            f"F1_action={f1A:.4f} F1_point={f1P:.4f} "
-            f"AUC={auc:.4f} Final~{final:.4f}"
+            f"F1_action={f1A:.4f} F1_action_last={f1A_last:.4f} "
+            f"F1_point={f1P:.4f} AUC={auc:.4f} Final~{final:.4f}"
         )
 
-        # 如果這輪 validation 更好，就保存這輪模型
-        if final > best_final:
+        if args.select_metric == "final":
+            current_score = final
+        elif args.select_metric == "action":
+            current_score = f1A
+        elif args.select_metric == "action_last":
+            current_score = f1A_last
+        else:
+            raise ValueError(f"Unsupported select_metric: {args.select_metric}")
+
+        # 如果這輪 validation 指標更好，就保存這輪模型
+        if current_score > best_score:
+            best_score = current_score
             best_final = final
             best_epoch = ep
             best_state = copy.deepcopy(model.state_dict())
+            best_metrics = {
+                "f1_action": f1A,
+                "f1_action_last": f1A_last,
+                "f1_point": f1P,
+                "auc": auc,
+            }
             bad_epochs = 0
         else:
             bad_epochs += 1
@@ -373,7 +496,8 @@ def main(args):
         if args.patience > 0 and bad_epochs >= args.patience:
             print(
                 f"Early stopping at epoch {ep}. "
-                f"Best epoch={best_epoch}, Best Final~{best_final:.4f}"
+                f"Best epoch={best_epoch}, Best {args.select_metric} score={best_score:.4f}, "
+                f"Best Final~{best_final:.4f}"
             )
             break
 
@@ -381,7 +505,15 @@ def main(args):
     if best_state is not None:
         model.load_state_dict(best_state)
         model.eval()
-        print(f"Loaded best model from epoch {best_epoch}, Final~{best_final:.4f}")
+        print(
+            f"Loaded best model from epoch {best_epoch}, "
+            f"selected_by={args.select_metric}, score={best_score:.4f}, Final~{best_final:.4f}"
+        )
+        print(
+            f"Best metrics: F1_action={best_metrics['f1_action']:.4f}, "
+            f"F1_action_last={best_metrics['f1_action_last']:.4f}, "
+            f"F1_point={best_metrics['f1_point']:.4f}, AUC={best_metrics['auc']:.4f}"
+        )
 
     # inference
     def pad2d_cap(a, m, pad_val=PAD_TOKEN):
@@ -456,6 +588,24 @@ if __name__ == "__main__":
     ap.add_argument("--drop", type=float, default=0.075)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val_size", type=float, default=0.10)
+
+    # 訓練 loss 權重，可調整模型訓練時對三個任務的重視程度。
+    # 注意：validation 的 Final~ 仍固定使用官方 0.4 / 0.4 / 0.2 公式。
+    ap.add_argument("--action_w", type=float, default=0.4)
+    ap.add_argument("--point_w", type=float, default=0.4)
+    ap.add_argument("--rally_w", type=float, default=0.2)
+    ap.add_argument("--weight_decay", type=float, default=0.0)
+
+    # V1.6 options.
+    # last_action_w: 0 = original all-timestep action loss only.
+    #                0.2 means 80% all-timestep action loss + 20% last-timestep action loss.
+    # select_metric: final keeps previous behavior; action/action_last are useful for ActionId-only experiments.
+    ap.add_argument("--last_action_w", type=float, default=0.0)
+    ap.add_argument(
+        "--select_metric",
+        choices=["final", "action", "action_last"],
+        default="final"
+    )
 
     # 0 表示不啟用 early stopping
     # 例如 --patience 2 代表連續 2 輪沒進步就停止

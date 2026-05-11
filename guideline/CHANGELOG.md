@@ -88,3 +88,94 @@ point_w=0.40
 rally_w=0.20
 weight_decay=0
 select_metric=final
+
+
+
+## 2026-05-12 01:43
+
+# 將 baseline 拆為三個模型
+
+目前將 baseline 拆成三個模型，分別負責預測：
+
+- `actionId`
+- `pointId`
+- `serverGetPoint`
+
+---
+
+## 使用方法
+
+### 1. 跑 action 模型
+
+```bash
+python baseline_action_without_slice.py --select_metric final
+```
+
+輸出檔案：
+
+```text
+submission_original_action.csv
+```
+
+說明：此輸出結果與原本 baseline 相同。
+
+---
+
+### 2. 跑 point 模型
+
+```bash
+python baseline_point_sliced.py --select_metric point
+```
+
+輸出檔案：
+
+```text
+submission_sliced_point.csv
+```
+
+---
+
+### 3. 跑 AUC 模型
+
+AUC 模型可以選擇以下其中一種方式執行。
+
+#### 方法一：使用 sliced AUC 模型
+
+```bash
+python baseline_auc_sliced.py --select_metric auc
+```
+
+輸出檔案：
+
+```text
+submission_sliced_auc.csv
+```
+
+#### 方法二：使用未切割的 AUC 模型
+
+```bash
+python baseline_auc_without_sliced.py --select_metric final
+```
+
+輸出檔案：
+
+```text
+submission_original_auc.csv
+```
+
+---
+
+### 4. 整合三個模型的預測結果
+
+```bash
+python merge_submission_three_models.py
+```
+
+輸出檔案：
+
+```text
+submission_merged_three_models.csv
+```
+
+
+

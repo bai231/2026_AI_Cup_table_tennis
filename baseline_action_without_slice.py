@@ -9,9 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, roc_auc_score
 
-SEED = 42
-random.seed(SEED); np.random.seed(SEED)
-torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+DEFAULT_SEED = 42
 
 FEATURES = [
     "sex", "handId", "strengthId", "spinId",
@@ -21,6 +19,20 @@ FEATURES = [
 
 PAD_TOKEN = 0
 ACTION_FEATURE_IDX = FEATURES.index("actionId")
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 # 把資料轉成可以用的格式
@@ -149,7 +161,10 @@ def add_score_features(df):
 
 
 def main(args):
+    set_seed(args.seed)
     print("start to run code\n")
+    print(f"model seed: {args.seed}")
+    print(f"split seed: {args.split_seed}")
 
     train = pd.read_csv(args.train).sort_values(["rally_uid", "strikeNumber"])
     test  = pd.read_csv(args.test).sort_values(["rally_uid", "strikeNumber"])
@@ -160,6 +175,7 @@ def main(args):
     # 把每回合球數限制在某個區段
     train["strikeNumber"] = train["strikeNumber"].clip(0, 40)
     test["strikeNumber"]  = test["strikeNumber"].clip(0, 40)
+
 
     # 把資料換成統一編碼
     # 0 保留給 padding。
@@ -242,7 +258,7 @@ def main(args):
     tr_idx, va_idx = train_test_split(
         idx,
         test_size=args.val_size,
-        random_state=42,
+        random_state=args.split_seed,
         stratify=(yR_all > 0.5)
     )
 
@@ -256,21 +272,30 @@ def main(args):
     act_counts = np.bincount(yA_tr[yA_tr != -1].ravel(), minlength=n_act) + 1
     pt_counts  = np.bincount(yP_tr[yP_tr != -1].ravel(), minlength=n_pt) + 1
 
-    act_w = torch.tensor(1.0 / act_counts, dtype=torch.float32)
+    act_w = torch.tensor(
+        1.0 / (act_counts ** args.action_weight_power),
+        dtype=torch.float32
+    )
     act_w = act_w * (n_act / act_w.sum())
 
     pt_w = torch.tensor(1.0 / pt_counts, dtype=torch.float32)
     pt_w = pt_w * (n_pt / pt_w.sum())
+
+    print(f"action_weight_power={args.action_weight_power:.3f}")
 
     # 建立資料集物件
     train_ds = RallyDataset(X_tr, yA_tr, yP_tr, yR_tr, L_tr)
     val_ds   = RallyDataset(X_va, yA_va, yP_va, yR_va, L_va)
 
     # 資料載入器
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch,
-        shuffle=True
+        shuffle=True,
+        generator=loader_generator
     )
 
     val_loader = DataLoader(
@@ -285,7 +310,7 @@ def main(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
-    print("model: MultiTaskLSTM V1.6 transition (original LSTM + Action Transition Head + adjustable loss weights)")
+    print("model: MultiTaskLSTM V1.6 transition + action_weight_power")
 
     model = MultiTaskLSTM(
         num_tokens_per_feature,
@@ -579,6 +604,9 @@ if __name__ == "__main__":
     # 保留 --sample 只是為了相容舊指令；目前輸出直接使用 test 的 rally_uid，不再讀 sample_submission.csv。
     ap.add_argument("--sample", default="sample_submission.csv")
     ap.add_argument("--out", default="submission_original_action.csv")
+    ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    ap.add_argument("--split_seed", type=int, default=42)
+    ap.add_argument("--action_weight_power", type=float, default=1.0)
 
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch", type=int, default=64)

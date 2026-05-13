@@ -269,6 +269,12 @@ def main(args):
     L_tr,  L_va  = L_all[tr_idx],  L_all[va_idx]
 
     # 計算權重
+    if args.action_weight_power < 0:
+        raise ValueError("action_weight_power must be non-negative")
+
+    if args.point_weight_power < 0:
+        raise ValueError("point_weight_power must be non-negative")
+
     act_counts = np.bincount(yA_tr[yA_tr != -1].ravel(), minlength=n_act) + 1
     pt_counts  = np.bincount(yP_tr[yP_tr != -1].ravel(), minlength=n_pt) + 1
 
@@ -278,10 +284,14 @@ def main(args):
     )
     act_w = act_w * (n_act / act_w.sum())
 
-    pt_w = torch.tensor(1.0 / pt_counts, dtype=torch.float32)
+    pt_w = torch.tensor(
+        1.0 / (pt_counts ** args.point_weight_power),
+        dtype=torch.float32
+    )
     pt_w = pt_w * (n_pt / pt_w.sum())
 
     print(f"action_weight_power={args.action_weight_power:.3f}")
+    print(f"point_weight_power={args.point_weight_power:.3f}")
 
     # 建立資料集物件
     train_ds = RallyDataset(X_tr, yA_tr, yP_tr, yR_tr, L_tr)
@@ -310,7 +320,7 @@ def main(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
-    print("model: MultiTaskLSTM V1.6 transition + action_weight_power")
+    print("model: MultiTaskLSTM V1.6 transition + action/point weight power")
 
     model = MultiTaskLSTM(
         num_tokens_per_feature,
@@ -607,6 +617,7 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--split_seed", type=int, default=42)
     ap.add_argument("--action_weight_power", type=float, default=1.0)
+    ap.add_argument("--point_weight_power", type=float, default=1.0)
 
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch", type=int, default=64)

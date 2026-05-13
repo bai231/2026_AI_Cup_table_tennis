@@ -4,31 +4,6 @@
 
 ---
 
-## 2026-05-06 06:35
-
-### Added
-- 新增 `quick_tune.py`，用來自動測試多組超參數。
-- 新增保存最佳 epoch 功能，現在設定的 epoch 為「最高上限」，每個 epoch 算完 validation 分數後，如果這輪比較好，會保存模型，最後的 sub.csv 會取用最佳模型。
-- 新增 patience (目前預設為0)，用來提前中斷epoch。假設設定 patience = 2，則代表如果連續 2 輪 validation 沒變好，就提前停止。
-
-### Changed
-- 調整 `baseline_code.py` 的預設參數。
-- 修改 unknown 類別，原本 test 裡如果出現 train 沒看過的類別，會被編成 0，而 0 同時也是 padding。新版改成：
-0 = padding
-1 ~ K = train 看過的類別
-K+1 = unknown 類別
-- 目前較佳參數為：
-
-```text
-epochs = 5
-emb = 20
-hidden = 224
-drop = 0.075
-lr = 0.001 或 0.0011
-batch = 64
-layers = 1
-```
-
 ## 2026-05-10 09:36
 ## 版本更新紀錄：LSTM V1.6 Action Transition Baseline
 
@@ -396,4 +371,407 @@ V1.7 不作為主力。
 ```
 
 ---
+# 更新紀錄：Action Model V1.6 + action/point class weight power
 
+本次更新 `baseline_action_without_slice.py`，目標是保留目前最穩定的 **V1.6 Action Transition Head** 架構，並針對 `actionId` 與 `pointId` 的 class weight 進行調整。
+
+目前尚未將 `--refit_full` 版本納入 GitHub，因此本紀錄只記錄到 `point_weight_power` 版本。
+
+---
+
+## 主要變更
+
+### 1. 保留 V1.6 Action Transition Head
+
+目前 action 模型維持 V1.6 架構：
+
+```text
+action_logits = LSTM_action_logits + transition_scale * action_transition_logits
+```
+
+其中：
+
+```text
+LSTM_action_logits       = self.act_head(o)
+action_transition_logits = self.act_transition(current_action_token)
+transition_scale         = learnable parameter
+```
+
+本次未採用以下實驗方向：
+
+```text
+V1.7 Context Transition Head
+V1.8 Gated Action Transition Head
+V1.9 Score Features
+Multi-seed majority vote ensemble
+```
+
+---
+
+### 2. 保留 seed / split_seed 分離設計
+
+目前保留：
+
+```bash
+--seed
+--split_seed
+```
+
+用途：
+
+```text
+--seed        控制模型初始化、random、numpy、torch、DataLoader shuffle
+--split_seed  控制 train / validation split
+```
+
+這樣可以讓不同 model seed 在同一份 validation split 上公平比較。
+
+---
+
+### 3. 新增 `--action_weight_power`
+
+`--action_weight_power` 用來控制 `actionId` class weight 的強度。
+
+原本 action class weight：
+
+```text
+1 / act_counts
+```
+
+新版 action class weight：
+
+```text
+1 / (act_counts ** action_weight_power)
+```
+
+設定意義：
+
+```text
+action_weight_power = 1.0   等同原本權重
+action_weight_power = 0.75  較溫和的稀有類別補償
+action_weight_power = 0.5   更溫和的稀有類別補償
+```
+
+實驗結果顯示，`action_weight_power=0.5` 明顯優於原本的 `1.0`。
+
+---
+
+### 4. 新增 `--point_weight_power`
+
+`--point_weight_power` 用來控制 `pointId` class weight 的強度。
+
+原本 point class weight：
+
+```text
+1 / pt_counts
+```
+
+新版 point class weight：
+
+```text
+1 / (pt_counts ** point_weight_power)
+```
+
+設定意義：
+
+```text
+point_weight_power = 1.0   等同原本權重
+point_weight_power = 0.75  較溫和的稀有類別補償
+point_weight_power = 0.5   更溫和的稀有類別補償
+```
+
+---
+
+## 實驗結果
+
+固定基礎設定：
+
+```bash
+--seed 42
+--split_seed 42
+--epochs 10
+--select_metric final
+```
+
+---
+
+### 1. action_weight_power 測試
+
+| action_weight_power | F1_action | F1_action_last | F1_point | AUC | Final~ |
+|---:|---:|---:|---:|---:|---:|
+| 1.0 | 0.3686 | 0.3195 | 0.2039 | 0.9990 | 0.4288 |
+| 0.75 | 0.3996 | 0.3367 | 0.2053 | 0.9992 | 0.4418 |
+| 0.5 | 0.4152 | 0.3551 | 0.2069 | 0.9990 | 0.4486 |
+
+結論：
+
+```text
+action_weight_power = 0.5 目前最佳。
+```
+
+---
+
+### 2. point_weight_power 測試
+
+固定：
+
+```bash
+--action_weight_power 0.5
+```
+
+| point_weight_power | F1_action | F1_action_last | F1_point | AUC | Final~ |
+|---:|---:|---:|---:|---:|---:|
+| 1.0 | 0.4152 | 0.3551 | 0.2069 | 0.9990 | 0.4486 |
+| 0.75 | 0.4198 | 0.3592 | 0.2192 | 0.9990 | 0.4554 |
+| 0.5 | 0.4191 | 0.3776 | 0.2180 | 0.9990 | 0.4546 |
+| 0.70 | 0.4167 | 0.3541 | 0.2222 | 0.9990 | 0.4554 |
+| 0.80 | 0.4180 | 0.3511 | 0.2158 | 0.9990 | 0.4533 |
+| 0.725 | 未超過 0.75 | - | - | - | - |
+
+結論：
+
+```text
+point_weight_power = 0.75 目前暫定最佳。
+point_weight_power = 0.70 與 0.75 表現接近，但 0.75 的 action 指標較佳。
+```
+
+---
+
+### 3. task loss weight 測試
+
+固定：
+
+```bash
+--action_weight_power 0.5
+--point_weight_power 0.75
+```
+
+| action_w | point_w | rally_w | F1_action | F1_action_last | F1_point | AUC | Final~ | 結論 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 0.40 | 0.40 | 0.20 | 0.4198 | 0.3592 | 0.2192 | 0.9990 | 0.4554 | 原本比例 |
+| 0.45 | 0.45 | 0.10 | 0.4243 | 0.3798 | 0.2184 | 0.9984 | 0.4567 | 目前最佳 |
+| 0.50 | 0.40 | 0.10 | 0.4202 | 0.3733 | 0.2181 | 0.9981 | 0.4549 | 略低 |
+| 0.40 | 0.50 | 0.10 | 0.4174 | 0.3620 | 0.2107 | 0.9984 | 0.4509 | 較差 |
+| 0.425 | 0.425 | 0.15 | 未超過 0.10 | - | - | - | - | 不採用 |
+| 0.475 | 0.475 | 0.05 | 未超過 0.10 | - | - | - | - | 不採用 |
+
+結論：
+
+```text
+降低 rally_w 到 0.10 有幫助。
+目前最佳 task loss weight 為：
+action_w = 0.45
+point_w  = 0.45
+rally_w  = 0.10
+```
+
+---
+
+## 目前最佳設定
+
+目前暫定最佳 full model 設定：
+
+```text
+V1.6 Action Transition Head
+action_weight_power = 0.5
+point_weight_power  = 0.75
+action_w = 0.45
+point_w  = 0.45
+rally_w  = 0.10
+seed = 42
+split_seed = 42
+lr = 0.001
+```
+
+目前主力 submission 檔案：
+
+```text
+submission_action_awp050_pwp075_tw4510_seed42.csv
+```
+
+---
+
+## 產生目前主力 submission 的指令
+
+```bash
+python baseline_action_without_slice.py \
+  --seed 42 \
+  --split_seed 42 \
+  --epochs 10 \
+  --select_metric final \
+  --action_weight_power 0.5 \
+  --point_weight_power 0.75 \
+  --action_w 0.45 \
+  --point_w 0.45 \
+  --rally_w 0.10 \
+  --out submission_action_awp050_pwp075_tw4510_seed42.csv
+```
+
+---
+
+## 平台測試狀態
+
+目前因提交次數限制，已知：
+
+```text
+submission_action_awp050_seed42.csv
+```
+
+平台分數高於原本 V1.6 full submission。
+
+目前最佳本地 validation 版本：
+
+```text
+submission_action_awp050_pwp075_tw4510_seed42.csv
+```
+
+尚待平台正式確認。
+
+---
+
+## 今日未採用實驗紀錄
+
+### 1. Multi-seed action model
+
+測試過：
+
+```text
+seed = 42
+seed = 777
+seed = 2026
+```
+
+平台測試結果顯示：
+
+```text
+原本 submission_original_action.csv 仍高於 seed777 / ensemble 相關版本。
+```
+
+結論：
+
+```text
+多 seed 單模型暫不取代主力。
+```
+
+---
+
+### 2. Action majority vote ensemble
+
+流程：
+
+```text
+submission_action_seed42.csv
+submission_action_seed777.csv
+submission_action_seed2026.csv
+        ↓
+majority vote
+        ↓
+submission_action_vote_42_777_2026.csv
+```
+
+平台測試結果：
+
+```text
+未超過原本 submission_original_action.csv。
+```
+
+結論：
+
+```text
+ensemble_action_vote.py 暫不作為主力流程。
+目前不建議加入正式 GitHub 更新。
+```
+
+---
+
+### 3. V1.7 Context Transition Head
+
+測試內容：
+
+```text
+在 action transition 外，加入 pointId、strikeId、positionId、spinId 等 context transition。
+```
+
+結果摘要：
+
+```text
+full context 未超過 V1.6。
+context small 雖然提高 F1_action_last，但 Final 較低。
+```
+
+結論：
+
+```text
+V1.7 不採用。
+```
+
+---
+
+### 4. V1.8 Gated Action Transition Head
+
+公式：
+
+```text
+gate = sigmoid(Linear(hidden))
+action_logits = LSTM_logits + gate * transition_scale * transition_logits
+```
+
+實驗結果：
+
+| Version | F1_action | F1_action_last | F1_point | AUC | Final~ |
+|---|---:|---:|---:|---:|---:|
+| V1.8 gated | 0.3647 | 0.3193 | 0.1994 | 0.9991 | 0.4255 |
+
+結論：
+
+```text
+V1.8 gated transition 使 Final 與 F1_action 下降，因此不採用。
+```
+
+---
+
+### 5. V1.9 Score Features
+
+新增特徵：
+
+```text
+scoreDiff = scoreSelf - scoreOther
+isLeading = scoreSelf > scoreOther
+isTie     = scoreSelf == scoreOther
+```
+
+實驗結果：
+
+| Version | F1_action | F1_action_last | F1_point | Final~ |
+|---|---:|---:|---:|---:|
+| V1.9 score features | 0.3602 | 0.3137 | 0.2012 | 0.4243 |
+
+結論：
+
+```text
+scoreSelf / scoreOther 原本已在 FEATURES 中，
+scoreDiff / isLeading / isTie 並未帶來提升，
+反而使 F1_action 與 Final 下降。
+因此 V1.9 不採用。
+```
+
+---
+
+## 目前結論
+
+目前最有效的方向不是增加模型結構，而是調整 loss 與 class weight：
+
+```text
+V1.6 Action Transition Head
++ action_weight_power = 0.5
++ point_weight_power = 0.75
++ action_w / point_w / rally_w = 0.45 / 0.45 / 0.10
+```
+
+下一步可以測試：
+
+```text
+--refit_full
+```
+
+但該功能尚未納入本次 GitHub 版本紀錄。

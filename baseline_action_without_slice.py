@@ -4,9 +4,10 @@ import numpy as np
 import pandas as pd
 import torch
 import copy
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import f1_score, roc_auc_score
 
 DEFAULT_SEED = 42
@@ -62,7 +63,17 @@ class MultiTaskLSTM(nn.Module):
 
     This targets ActionId Prediction while keeping pointId/serverGetPoint behavior close to V1.5.
     """
-    def __init__(self, num_tokens_per_feature, n_act, n_pt, emb_dim=16, hidden=128, num_layers=1, dropout=0.2):
+    def __init__(
+        self,
+        num_tokens_per_feature,
+        n_act,
+        n_pt,
+        emb_dim=16,
+        hidden=128,
+        num_layers=1,
+        dropout=0.2,
+        action_transition_prior=None
+    ):
         super().__init__()
 
         self.embs = nn.ModuleList([
@@ -94,8 +105,20 @@ class MultiTaskLSTM(nn.Module):
             padding_idx=PAD_TOKEN
         )
 
-        # Start from the original baseline behavior.
-        nn.init.zeros_(self.act_transition.weight)
+        if action_transition_prior is not None:
+            if tuple(action_transition_prior.shape) != tuple(self.act_transition.weight.shape):
+                raise ValueError(
+                    "action_transition_prior shape mismatch: "
+                    f"expected {tuple(self.act_transition.weight.shape)}, "
+                    f"got {tuple(action_transition_prior.shape)}"
+                )
+            with torch.no_grad():
+                self.act_transition.weight.copy_(
+                    action_transition_prior.to(dtype=self.act_transition.weight.dtype)
+                )
+        else:
+            # Start from the original baseline behavior.
+            nn.init.zeros_(self.act_transition.weight)
 
         # Learn how much the transition shortcut should affect action logits.
         self.transition_scale = nn.Parameter(torch.tensor(1.0))
@@ -140,6 +163,89 @@ class MultiTaskLSTM(nn.Module):
         return act_logits, pt_logits, rally_logits
 
 
+class LabelSmoothingCrossEntropyLoss(nn.Module):
+    def __init__(self, smoothing=0.0, weight=None, ignore_index=-1, reduction="mean"):
+        super().__init__()
+        self.smoothing = smoothing
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+
+        if weight is not None:
+            self.register_buffer("weight", weight)
+        else:
+            self.weight = None
+
+    def forward(self, logits, targets):
+        valid = targets != self.ignore_index
+
+        if valid.sum() == 0:
+            return logits.sum() * 0.0
+
+        logits = logits[valid]
+        targets = targets[valid]
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        n_classes = logits.size(-1)
+
+        true_dist = torch.full_like(log_probs, self.smoothing / max(n_classes - 1, 1))
+        true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
+
+        loss = -(true_dist * log_probs).sum(dim=1)
+        sample_weight = None
+
+        if self.weight is not None:
+            sample_weight = self.weight[targets]
+            loss = loss * sample_weight
+
+        if self.reduction == "mean":
+            if sample_weight is not None:
+                return loss.sum() / sample_weight.sum().clamp(min=1e-8)
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+class FocalCrossEntropyLoss(nn.Module):
+    def __init__(self, gamma=1.0, weight=None, ignore_index=-1, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+
+        if weight is not None:
+            self.register_buffer("weight", weight)
+        else:
+            self.weight = None
+
+    def forward(self, logits, targets):
+        valid = targets != self.ignore_index
+
+        if valid.sum() == 0:
+            return logits.sum() * 0.0
+
+        logits = logits[valid]
+        targets = targets[valid]
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+
+        target_log_probs = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        target_probs = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        focal_factor = (1.0 - target_probs).clamp(min=1e-8) ** self.gamma
+        loss = -focal_factor * target_log_probs
+
+        if self.weight is not None:
+            loss = loss * self.weight[targets]
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
 def pad2d(a, m, pad_val=PAD_TOKEN):
     out = np.full((m, a.shape[1]), pad_val, dtype=np.int64)
     out[:len(a)] = a
@@ -160,13 +266,88 @@ def add_score_features(df):
     return df
 
 
+def add_rally_samples(
+    X_list,
+    yA_list,
+    yP_list,
+    yR_list,
+    L_list,
+    rid_list,
+    rid,
+    rally_data,
+    use_prefix_aug,
+    prefix_last_k,
+    prefix_min_len
+):
+    X_full, yA_full, yP_full, yR = rally_data
+    full_cut = len(X_full) - 1
+
+    if full_cut < 1:
+        return
+
+    cut_ends = [full_cut]
+
+    if use_prefix_aug and prefix_last_k > 0:
+        prefix_start = max(prefix_min_len, full_cut - prefix_last_k)
+        for cut_end in range(prefix_start, full_cut):
+            cut_ends.append(cut_end)
+
+    for cut_end in cut_ends:
+        X = X_full[:cut_end]
+        yA = yA_full[1:cut_end + 1]
+        yP = yP_full[1:cut_end + 1]
+
+        if len(X) != cut_end or len(yA) != cut_end or len(yP) != cut_end:
+            raise ValueError(f"Invalid prefix sample length for rally_uid={rid}, cut_end={cut_end}")
+
+        X_list.append(X)
+        yA_list.append(yA)
+        yP_list.append(yP)
+        yR_list.append(yR)
+        L_list.append(cut_end)
+        rid_list.append(rid)
+
+
+def build_action_transition_prior_from_arrays(
+    X_arr,
+    yA_arr,
+    num_action_embeddings,
+    n_act,
+    alpha=1.0,
+    strength=1.0
+):
+    counts = np.zeros((num_action_embeddings, n_act), dtype=np.float64)
+
+    cur_tokens = X_arr[:, :, ACTION_FEATURE_IDX].reshape(-1)
+    next_actions = yA_arr.reshape(-1)
+    valid = (next_actions != -1) & (cur_tokens != PAD_TOKEN)
+
+    if valid.any():
+        np.add.at(counts, (cur_tokens[valid], next_actions[valid]), 1.0)
+
+    smoothed = counts + alpha
+    denom = counts.sum(axis=1, keepdims=True) + alpha * n_act
+    probs = np.full((num_action_embeddings, n_act), 1.0 / n_act, dtype=np.float64)
+
+    nonzero = denom.squeeze(1) > 0
+    if np.any(nonzero):
+        probs[nonzero] = smoothed[nonzero] / denom[nonzero]
+
+    log_prior = np.log(probs)
+    log_prior = log_prior - log_prior.mean(axis=1, keepdims=True)
+    log_prior *= strength
+    log_prior[PAD_TOKEN, :] = 0.0
+
+    return torch.tensor(log_prior, dtype=torch.float32)
+
+
 def main(args):
     set_seed(args.seed)
     print("start to run code\n")
     print(f"model seed: {args.seed}")
     print(f"split seed: {args.split_seed}")
 
-    def build_model():
+    def build_model(action_transition_prior=None):
         return MultiTaskLSTM(
             num_tokens_per_feature,
             n_act,
@@ -174,7 +355,8 @@ def main(args):
             emb_dim=args.emb,
             hidden=args.hidden,
             num_layers=args.layers,
-            dropout=args.drop
+            dropout=args.drop,
+            action_transition_prior=action_transition_prior
         ).to(device)
 
     def build_optimizer(model_obj):
@@ -204,6 +386,37 @@ def main(args):
         pt_w_local = pt_w_local * (n_pt / pt_w_local.sum())
 
         return act_w_local, pt_w_local
+
+    def make_action_criterion(action_weight):
+        action_weight = action_weight.to(device)
+
+        if args.action_loss_type == "ce":
+            try:
+                return nn.CrossEntropyLoss(
+                    ignore_index=-1,
+                    weight=action_weight,
+                    label_smoothing=args.action_label_smoothing
+                )
+            except TypeError:
+                return LabelSmoothingCrossEntropyLoss(
+                    smoothing=args.action_label_smoothing,
+                    weight=action_weight,
+                    ignore_index=-1,
+                    reduction="mean"
+                )
+
+        if args.action_loss_type == "focal":
+            if args.action_label_smoothing > 0:
+                raise ValueError("Do not combine focal loss with action_label_smoothing in this version.")
+
+            return FocalCrossEntropyLoss(
+                gamma=args.action_focal_gamma,
+                weight=action_weight,
+                ignore_index=-1,
+                reduction="mean"
+            )
+
+        raise ValueError(f"Unsupported action_loss_type: {args.action_loss_type}")
 
     train = pd.read_csv(args.train).sort_values(["rally_uid", "strikeNumber"])
     test  = pd.read_csv(args.test).sort_values(["rally_uid", "strikeNumber"])
@@ -253,30 +466,41 @@ def main(args):
         return np.stack(outs, axis=1)
 
     # 建置預測用資料
-    X_list, yA_list, yP_list, yR_list, L_list = [], [], [], [], []
+    rally_cache = {}
+    valid_rids = []
+    valid_yR = []
+    max_lengths = []
 
     for rid, g in train.groupby("rally_uid"):
         if len(g) < 2:
             continue
 
-        X = encode_frame(g)[:-1]
-        yA = g["actionId"].values[1:].astype(np.int64)
-        yP = g["pointId"].values[1:].astype(np.int64)
+        X_full = encode_frame(g)
+        yA_full = g["actionId"].values.astype(np.int64)
+        yP_full = g["pointId"].values.astype(np.int64)
+        yR = int(g["serverGetPoint"].iloc[0])
 
-        X_list.append(X)
-        yA_list.append(yA)
-        yP_list.append(yP)
+        rally_cache[int(rid)] = (X_full, yA_full, yP_full, yR)
+        valid_rids.append(int(rid))
+        valid_yR.append(yR)
+        max_lengths.append(len(g) - 1)
 
-        yR_list.append(int(g["serverGetPoint"].iloc[0]))
-        L_list.append(len(X))
+    if not valid_rids:
+        raise ValueError("No valid training rallies with length >= 2 were found.")
 
-    MAXLEN = max(L_list)
+    MAXLEN = max(max_lengths)
 
-    X_all  = np.stack([pad2d(s, MAXLEN) for s in X_list])
-    yA_all = np.stack([pad1d(s, MAXLEN) for s in yA_list])
-    yP_all = np.stack([pad1d(s, MAXLEN) for s in yP_list])
-    yR_all = np.array(yR_list, dtype=np.float32)
-    L_all  = np.array(L_list, dtype=np.int64)
+    legacy_X_list = [rally_cache[rid][0][:-1] for rid in valid_rids]
+    legacy_yA_list = [rally_cache[rid][1][1:] for rid in valid_rids]
+    legacy_yP_list = [rally_cache[rid][2][1:] for rid in valid_rids]
+    legacy_yR_list = [rally_cache[rid][3] for rid in valid_rids]
+    legacy_L_list = [len(seq) for seq in legacy_X_list]
+
+    X_all  = np.stack([pad2d(s, MAXLEN) for s in legacy_X_list])
+    yA_all = np.stack([pad1d(s, MAXLEN) for s in legacy_yA_list])
+    yP_all = np.stack([pad1d(s, MAXLEN) for s in legacy_yP_list])
+    yR_all = np.array(legacy_yR_list, dtype=np.float32)
+    L_all  = np.array(legacy_L_list, dtype=np.int64)
 
     # 將 ID 建立成字典
     act_classes = np.sort(train["actionId"].unique())
@@ -288,7 +512,7 @@ def main(args):
     pt_id2idx = {v: i for i, v in enumerate(pt_classes)}
 
     # 把原本的項目轉換成新代碼
-    yA_all = np.vectorize(act_id2idx.get)(yA_all, -1)
+    # Legacy sample-index split path removed; rally_uid-based split is used below.
     yP_all = np.vectorize(pt_id2idx.get)(yP_all, -1)
 
     # 切出一部分的資料當 validation
@@ -307,6 +531,69 @@ def main(args):
     yR_tr, yR_va = yR_all[tr_idx], yR_all[va_idx]
     L_tr,  L_va  = L_all[tr_idx],  L_all[va_idx]
 
+    def build_sample_arrays(rids, use_prefix_aug):
+        X_list_aug, yA_list_aug, yP_list_aug = [], [], []
+        yR_list_aug, L_list_aug, rid_list_aug = [], [], []
+
+        for rid in rids:
+            add_rally_samples(
+                X_list_aug,
+                yA_list_aug,
+                yP_list_aug,
+                yR_list_aug,
+                L_list_aug,
+                rid_list_aug,
+                int(rid),
+                rally_cache[int(rid)],
+                use_prefix_aug=use_prefix_aug,
+                prefix_last_k=args.prefix_last_k,
+                prefix_min_len=args.prefix_min_len
+            )
+
+        if not X_list_aug:
+            raise ValueError("No training samples were built. Check prefix augmentation settings.")
+
+        X_arr = np.stack([pad2d(s, MAXLEN) for s in X_list_aug])
+        yA_arr = np.stack([pad1d(s, MAXLEN) for s in yA_list_aug])
+        yP_arr = np.stack([pad1d(s, MAXLEN) for s in yP_list_aug])
+        yR_arr = np.array(yR_list_aug, dtype=np.float32)
+        L_arr = np.array(L_list_aug, dtype=np.int64)
+        rid_arr = np.array(rid_list_aug, dtype=np.int64)
+
+        yA_arr = np.vectorize(act_id2idx.get)(yA_arr, -1)
+        yP_arr = np.vectorize(pt_id2idx.get)(yP_arr, -1)
+
+        return X_arr, yA_arr, yP_arr, yR_arr, L_arr, rid_arr
+
+    if args.prefix_last_k < 0:
+        raise ValueError("prefix_last_k must be non-negative")
+
+    if args.prefix_min_len < 1:
+        raise ValueError("prefix_min_len must be positive")
+
+    valid_rids = np.array(valid_rids, dtype=np.int64)
+    valid_yR = np.array(valid_yR, dtype=np.int64)
+
+    tr_rids, va_rids = train_test_split(
+        valid_rids,
+        test_size=args.val_size,
+        random_state=args.split_seed,
+        stratify=valid_yR
+    )
+
+    X_tr, yA_tr, yP_tr, yR_tr, L_tr, train_sample_rids = build_sample_arrays(
+        tr_rids,
+        use_prefix_aug=args.prefix_aug
+    )
+    X_va, yA_va, yP_va, yR_va, L_va, val_sample_rids = build_sample_arrays(
+        va_rids,
+        use_prefix_aug=False
+    )
+    X_all, yA_all, yP_all, yR_all, L_all, full_sample_rids = build_sample_arrays(
+        valid_rids,
+        use_prefix_aug=args.prefix_aug
+    )
+
     # 計算權重
     if args.action_weight_power < 0:
         raise ValueError("action_weight_power must be non-negative")
@@ -314,14 +601,56 @@ def main(args):
     if args.point_weight_power < 0:
         raise ValueError("point_weight_power must be non-negative")
 
+    if args.action_focal_gamma < 0:
+        raise ValueError("action_focal_gamma must be non-negative")
+
+    if not (0.0 <= args.action_label_smoothing < 1.0):
+        raise ValueError("action_label_smoothing must be in [0, 1)")
+
+    if args.action_loss_type == "focal" and args.action_label_smoothing > 0:
+        raise ValueError("Do not combine focal loss with action_label_smoothing in this version.")
+
+    if args.transition_prior_alpha < 0:
+        raise ValueError("transition_prior_alpha must be non-negative")
+
+    if args.transition_prior_strength < 0:
+        raise ValueError("transition_prior_strength must be non-negative")
+
+    if args.prefix_last_k < 0:
+        raise ValueError("prefix_last_k must be non-negative")
+
+    if args.prefix_min_len < 1:
+        raise ValueError("prefix_min_len must be positive")
+
+    if args.kfolds < 2:
+        raise ValueError("kfolds must be at least 2")
+
+    if args.kfold_eval and args.refit_full:
+        raise ValueError("Do not use --refit_full with --kfold_eval.")
+
     act_w, pt_w = build_class_weights(yA_tr, yP_tr)
 
     print(f"action_weight_power={args.action_weight_power:.3f}")
     print(f"point_weight_power={args.point_weight_power:.3f}")
+    print(f"action_loss_type={args.action_loss_type}")
+    print(f"action_focal_gamma={args.action_focal_gamma:.3f}")
+    print(f"action_label_smoothing={args.action_label_smoothing:.3f}")
+    print(f"init_transition_prior={args.init_transition_prior}")
+    print(f"transition_prior_alpha={args.transition_prior_alpha:.3f}")
+    print(f"transition_prior_strength={args.transition_prior_strength:.3f}")
+    print(f"prefix_aug={args.prefix_aug}")
+    print(f"prefix_last_k={args.prefix_last_k}")
+    print(f"prefix_min_len={args.prefix_min_len}")
 
     # 建立資料集物件
     train_ds = RallyDataset(X_tr, yA_tr, yP_tr, yR_tr, L_tr)
     val_ds   = RallyDataset(X_va, yA_va, yP_va, yR_va, L_va)
+
+    if args.prefix_aug:
+        print("train samples:", len(train_ds))
+        print("val samples:", len(val_ds))
+        print("train rallies:", len(tr_rids))
+        print("val rallies:", len(va_rids))
 
     # 資料載入器
     loader_generator = torch.Generator()
@@ -343,14 +672,27 @@ def main(args):
     # num_tokens_per_feature 裡的 n 代表該 feature 最大 token id
     # Embedding 會建立 0 ~ n
     num_tokens_per_feature = [len(cats[c]) + 1 for c in FEATURES]
+    num_action_embeddings = num_tokens_per_feature[ACTION_FEATURE_IDX] + 1
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
     print("model: MultiTaskLSTM V1.6 transition + action/point weight power")
 
-    model = build_model()
+    action_transition_prior = None
+    if args.init_transition_prior:
+        action_transition_prior = build_action_transition_prior_from_arrays(
+            X_tr,
+            yA_tr,
+            num_action_embeddings=num_action_embeddings,
+            n_act=n_act,
+            alpha=args.transition_prior_alpha,
+            strength=args.transition_prior_strength
+        )
+        print("Action transition prior initialized from training split.")
 
-    ce_action = nn.CrossEntropyLoss(ignore_index=-1, weight=act_w.to(device))
+    model = build_model(action_transition_prior=action_transition_prior)
+
+    ce_action = make_action_criterion(act_w)
     ce_point  = nn.CrossEntropyLoss(ignore_index=-1, weight=pt_w.to(device))
     bce_rally = nn.BCEWithLogitsLoss()
 
@@ -402,7 +744,342 @@ def main(args):
             + args.last_action_w * action_loss_last
         )
 
+    def select_metric_score(final, f1A, f1A_last):
+        if args.select_metric == "final":
+            return final
+        if args.select_metric == "action":
+            return f1A
+        if args.select_metric == "action_last":
+            return f1A_last
+        raise ValueError(f"Unsupported select_metric: {args.select_metric}")
+
+    def run_training_split(
+        X_train,
+        yA_train,
+        yP_train,
+        yR_train,
+        L_train,
+        X_val,
+        yA_val,
+        yP_val,
+        yR_val,
+        L_val,
+        train_rallies_count,
+        val_rallies_count,
+        log_prefix=None
+    ):
+        train_ds_local = RallyDataset(X_train, yA_train, yP_train, yR_train, L_train)
+        val_ds_local = RallyDataset(X_val, yA_val, yP_val, yR_val, L_val)
+
+        if args.prefix_aug:
+            prefix_label = f"{log_prefix} " if log_prefix else ""
+            print(f"{prefix_label}train samples: {len(train_ds_local)}")
+            print(f"{prefix_label}val samples: {len(val_ds_local)}")
+            print(f"{prefix_label}train rallies: {train_rallies_count}")
+            print(f"{prefix_label}val rallies: {val_rallies_count}")
+
+        loader_generator_local = torch.Generator()
+        loader_generator_local.manual_seed(args.seed)
+
+        train_loader_local = DataLoader(
+            train_ds_local,
+            batch_size=args.batch,
+            shuffle=True,
+            generator=loader_generator_local
+        )
+
+        val_loader_local = DataLoader(
+            val_ds_local,
+            batch_size=max(args.batch * 2, 128),
+            shuffle=False
+        )
+
+        act_w_local, pt_w_local = build_class_weights(yA_train, yP_train)
+        action_criterion_local = make_action_criterion(act_w_local)
+        point_criterion_local = nn.CrossEntropyLoss(ignore_index=-1, weight=pt_w_local.to(device))
+        rally_criterion_local = nn.BCEWithLogitsLoss()
+
+        transition_prior_local = None
+        if args.init_transition_prior:
+            transition_prior_local = build_action_transition_prior_from_arrays(
+                X_train,
+                yA_train,
+                num_action_embeddings=num_action_embeddings,
+                n_act=n_act,
+                alpha=args.transition_prior_alpha,
+                strength=args.transition_prior_strength
+            )
+            if log_prefix:
+                print(f"{log_prefix} Action transition prior initialized from training split.")
+            else:
+                print("Action transition prior initialized from training split.")
+
+        set_seed(args.seed)
+        model_local = build_model(action_transition_prior=transition_prior_local)
+        opt_local = build_optimizer(model_local)
+
+        best_score_local = -1.0
+        best_final_local = -1.0
+        best_epoch_local = 0
+        best_state_local = None
+        best_metrics_local = {
+            "f1_action": 0.0,
+            "f1_action_last": 0.0,
+            "f1_point": 0.0,
+            "auc": 0.5,
+        }
+        bad_epochs_local = 0
+
+        for ep in range(1, args.epochs + 1):
+            model_local.train()
+            run_loss = 0.0
+
+            for Xb, yAb, yPb, yRb, Lb in train_loader_local:
+                Xb = Xb.to(device)
+                yAb = yAb.to(device)
+                yPb = yPb.to(device)
+                yRb = yRb.to(device)
+                Lb = Lb.to(device)
+
+                opt_local.zero_grad()
+
+                la, lp, lr = model_local(Xb, Lb)
+
+                action_loss = compute_action_loss(la, yAb, Lb, action_criterion_local)
+                point_loss = point_criterion_local(lp.reshape(-1, lp.size(-1)), yPb.reshape(-1))
+                rally_loss = rally_criterion_local(lr, yRb)
+
+                loss = (
+                    action_loss_w * action_loss
+                    + point_loss_w * point_loss
+                    + rally_loss_w * rally_loss
+                )
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model_local.parameters(), 1.0)
+                opt_local.step()
+
+                run_loss += loss.item() * Xb.size(0)
+
+            model_local.eval()
+            val_loss = 0.0
+
+            allA, allAp = [], []
+            allA_last, allAp_last = [], []
+            allP, allPp = [], []
+            allR, allRp = [], []
+
+            with torch.no_grad():
+                for Xb, yAb, yPb, yRb, Lb in val_loader_local:
+                    Xb = Xb.to(device)
+                    yAb = yAb.to(device)
+                    yPb = yPb.to(device)
+                    yRb = yRb.to(device)
+                    Lb = Lb.to(device)
+
+                    la, lp, lr = model_local(Xb, Lb)
+
+                    action_loss = compute_action_loss(la, yAb, Lb, action_criterion_local)
+                    point_loss = point_criterion_local(lp.reshape(-1, lp.size(-1)), yPb.reshape(-1))
+                    rally_loss = rally_criterion_local(lr, yRb)
+
+                    loss = (
+                        0.4 * action_loss
+                        + 0.4 * point_loss
+                        + 0.2 * rally_loss
+                    )
+
+                    val_loss += loss.item() * Xb.size(0)
+
+                    allR += yRb.detach().cpu().tolist()
+                    allRp += torch.sigmoid(lr).detach().cpu().tolist()
+
+                    yA_flat = yAb.reshape(-1).detach().cpu().numpy()
+                    yP_flat = yPb.reshape(-1).detach().cpu().numpy()
+
+                    a_pred = la.argmax(-1).reshape(-1).detach().cpu().numpy()
+                    p_pred = lp.argmax(-1).reshape(-1).detach().cpu().numpy()
+
+                    mA = (yA_flat != -1)
+                    mP = (yP_flat != -1)
+
+                    allA += yA_flat[mA].tolist()
+                    allAp += a_pred[mA].tolist()
+
+                    bidx = torch.arange(Xb.size(0), device=device)
+                    last_pos = (Lb - 1).clamp(min=0)
+                    a_last_true = yAb[bidx, last_pos].detach().cpu().numpy()
+                    a_last_pred = la[bidx, last_pos].argmax(-1).detach().cpu().numpy()
+                    mA_last = (a_last_true != -1)
+                    allA_last += a_last_true[mA_last].tolist()
+                    allAp_last += a_last_pred[mA_last].tolist()
+
+                    allP += yP_flat[mP].tolist()
+                    allPp += p_pred[mP].tolist()
+
+            tr_loss = run_loss / len(train_loader_local.dataset)
+            va_loss = val_loss / len(val_loader_local.dataset)
+
+            try:
+                f1A = f1_score(allA, allAp, average="macro") if len(allA) else 0.0
+                f1A_last = f1_score(allA_last, allAp_last, average="macro") if len(allA_last) else 0.0
+                f1P = f1_score(allP, allPp, average="macro") if len(allP) else 0.0
+                auc = roc_auc_score(allR, allRp) if len(set(allR)) > 1 else 0.5
+            except Exception:
+                f1A, f1A_last, f1P, auc = 0.0, 0.0, 0.0, 0.5
+
+            final = 0.4 * f1A + 0.4 * f1P + 0.2 * auc
+
+            if log_prefix:
+                print(
+                    f"[{log_prefix} Epoch {ep}/{args.epochs}] "
+                    f"train_loss={tr_loss:.4f} val_loss={va_loss:.4f} "
+                    f"F1_action={f1A:.4f} F1_action_last={f1A_last:.4f} "
+                    f"F1_point={f1P:.4f} AUC={auc:.4f} Final~{final:.4f}"
+                )
+            else:
+                print(
+                    f"[Epoch {ep}/{args.epochs}] "
+                    f"train_loss={tr_loss:.4f} val_loss={va_loss:.4f} "
+                    f"F1_action={f1A:.4f} F1_action_last={f1A_last:.4f} "
+                    f"F1_point={f1P:.4f} AUC={auc:.4f} Final~{final:.4f}"
+                )
+
+            current_score = select_metric_score(final, f1A, f1A_last)
+
+            if current_score > best_score_local:
+                best_score_local = current_score
+                best_final_local = final
+                best_epoch_local = ep
+                best_state_local = copy.deepcopy(model_local.state_dict())
+                best_metrics_local = {
+                    "f1_action": f1A,
+                    "f1_action_last": f1A_last,
+                    "f1_point": f1P,
+                    "auc": auc,
+                }
+                bad_epochs_local = 0
+            else:
+                bad_epochs_local += 1
+
+            if args.patience > 0 and bad_epochs_local >= args.patience:
+                if log_prefix:
+                    print(
+                        f"{log_prefix} early stopping at epoch {ep}. "
+                        f"Best epoch={best_epoch_local}, Best {args.select_metric} score={best_score_local:.4f}, "
+                        f"Best Final~{best_final_local:.4f}"
+                    )
+                else:
+                    print(
+                        f"Early stopping at epoch {ep}. "
+                        f"Best epoch={best_epoch_local}, Best {args.select_metric} score={best_score_local:.4f}, "
+                        f"Best Final~{best_final_local:.4f}"
+                    )
+                break
+
+        if best_state_local is None:
+            raise ValueError("Training did not produce a best_state.")
+
+        model_local.load_state_dict(best_state_local)
+        model_local.eval()
+
+        return {
+            "model": model_local,
+            "best_epoch": best_epoch_local,
+            "best_score": best_score_local,
+            "best_final": best_final_local,
+            "best_metrics": best_metrics_local,
+            "train_samples": len(train_ds_local),
+            "val_samples": len(val_ds_local),
+            "train_rallies": train_rallies_count,
+            "val_rallies": val_rallies_count,
+        }
+
     # 保存 validation 最佳 epoch。預設仍用官方近似 Final~；可改用 action/action_last 選模型。
+    if args.kfold_eval:
+        class_counts = np.bincount(valid_yR.astype(np.int64))
+        if len(valid_rids) < args.kfolds:
+            raise ValueError("kfolds cannot exceed the number of valid rallies.")
+        if np.any(class_counts < args.kfolds):
+            raise ValueError("Each stratify class must have at least kfolds rallies.")
+
+        print(f"kfold_eval={args.kfold_eval}")
+        print(f"kfolds={args.kfolds}")
+        print(f"kfold_seed={args.kfold_seed}")
+
+        skf = StratifiedKFold(
+            n_splits=args.kfolds,
+            shuffle=True,
+            random_state=args.kfold_seed
+        )
+
+        fold_rows = []
+
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(valid_rids, valid_yR > 0.5), start=1):
+            fold_tr_rids = valid_rids[train_idx]
+            fold_va_rids = valid_rids[val_idx]
+
+            X_tr_fold, yA_tr_fold, yP_tr_fold, yR_tr_fold, L_tr_fold, _ = build_sample_arrays(
+                fold_tr_rids,
+                use_prefix_aug=args.prefix_aug
+            )
+            X_va_fold, yA_va_fold, yP_va_fold, yR_va_fold, L_va_fold, _ = build_sample_arrays(
+                fold_va_rids,
+                use_prefix_aug=False
+            )
+
+            print(f"=== Fold {fold_idx}/{args.kfolds} ===")
+
+            fold_result = run_training_split(
+                X_tr_fold,
+                yA_tr_fold,
+                yP_tr_fold,
+                yR_tr_fold,
+                L_tr_fold,
+                X_va_fold,
+                yA_va_fold,
+                yP_va_fold,
+                yR_va_fold,
+                L_va_fold,
+                train_rallies_count=len(fold_tr_rids),
+                val_rallies_count=len(fold_va_rids),
+                log_prefix=f"Fold {fold_idx}"
+            )
+
+            fold_rows.append({
+                "fold": fold_idx,
+                "train_rallies": len(fold_tr_rids),
+                "val_rallies": len(fold_va_rids),
+                "train_samples": fold_result["train_samples"],
+                "val_samples": fold_result["val_samples"],
+                "best_epoch": fold_result["best_epoch"],
+                "selected_metric": args.select_metric,
+                "best_score": fold_result["best_score"],
+                "best_final": fold_result["best_final"],
+                "best_f1_action": fold_result["best_metrics"]["f1_action"],
+                "best_f1_action_last": fold_result["best_metrics"]["f1_action_last"],
+                "best_f1_point": fold_result["best_metrics"]["f1_point"],
+                "best_auc": fold_result["best_metrics"]["auc"],
+            })
+
+        fold_df = pd.DataFrame(fold_rows)
+        fold_df.to_csv(args.kfold_out, index=False)
+        print(f"Saved k-fold results to: {args.kfold_out}")
+
+        final_vals = fold_df["best_final"].to_numpy(dtype=np.float64)
+        f1_action_vals = fold_df["best_f1_action"].to_numpy(dtype=np.float64)
+        f1_action_last_vals = fold_df["best_f1_action_last"].to_numpy(dtype=np.float64)
+        f1_point_vals = fold_df["best_f1_point"].to_numpy(dtype=np.float64)
+        auc_vals = fold_df["best_auc"].to_numpy(dtype=np.float64)
+
+        print("K-Fold Summary:")
+        print(f"Final mean={final_vals.mean():.4f}, std={final_vals.std():.4f}")
+        print(f"F1_action mean={f1_action_vals.mean():.4f}, std={f1_action_vals.std():.4f}")
+        print(f"F1_action_last mean={f1_action_last_vals.mean():.4f}, std={f1_action_last_vals.std():.4f}")
+        print(f"F1_point mean={f1_point_vals.mean():.4f}, std={f1_point_vals.std():.4f}")
+        print(f"AUC mean={auc_vals.mean():.4f}, std={auc_vals.std():.4f}")
+        return
+
     best_score = -1.0
     best_final = -1.0
     best_epoch = 0
@@ -591,12 +1268,24 @@ def main(args):
 
         full_act_w, full_pt_w = build_class_weights(yA_all, yP_all)
 
-        refit_ce_action = nn.CrossEntropyLoss(ignore_index=-1, weight=full_act_w.to(device))
+        refit_ce_action = make_action_criterion(full_act_w)
         refit_ce_point  = nn.CrossEntropyLoss(ignore_index=-1, weight=full_pt_w.to(device))
         refit_bce_rally = nn.BCEWithLogitsLoss()
 
+        refit_action_transition_prior = None
+        if args.init_transition_prior:
+            refit_action_transition_prior = build_action_transition_prior_from_arrays(
+                X_all,
+                yA_all,
+                num_action_embeddings=num_action_embeddings,
+                n_act=n_act,
+                alpha=args.transition_prior_alpha,
+                strength=args.transition_prior_strength
+            )
+            print("Action transition prior initialized from full training data for refit.")
+
         set_seed(args.seed)
-        model = build_model()
+        model = build_model(action_transition_prior=refit_action_transition_prior)
         opt = build_optimizer(model)
 
         for ep in range(1, refit_epochs + 1):
@@ -703,8 +1392,21 @@ if __name__ == "__main__":
     ap.add_argument("--split_seed", type=int, default=42)
     ap.add_argument("--action_weight_power", type=float, default=1.0)
     ap.add_argument("--point_weight_power", type=float, default=1.0)
+    ap.add_argument("--action_loss_type", choices=["ce", "focal"], default="ce")
+    ap.add_argument("--action_focal_gamma", type=float, default=1.0)
+    ap.add_argument("--action_label_smoothing", type=float, default=0.0)
+    ap.add_argument("--prefix_aug", action="store_true")
+    ap.add_argument("--prefix_last_k", type=int, default=3)
+    ap.add_argument("--prefix_min_len", type=int, default=5)
+    ap.add_argument("--init_transition_prior", action="store_true")
+    ap.add_argument("--transition_prior_alpha", type=float, default=1.0)
+    ap.add_argument("--transition_prior_strength", type=float, default=1.0)
     ap.add_argument("--refit_full", action="store_true")
     ap.add_argument("--refit_epochs", type=int, default=0)
+    ap.add_argument("--kfold_eval", action="store_true")
+    ap.add_argument("--kfolds", type=int, default=5)
+    ap.add_argument("--kfold_seed", type=int, default=42)
+    ap.add_argument("--kfold_out", default="kfold_results.csv")
 
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch", type=int, default=64)

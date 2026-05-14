@@ -166,6 +166,45 @@ def main(args):
     print(f"model seed: {args.seed}")
     print(f"split seed: {args.split_seed}")
 
+    def build_model():
+        return MultiTaskLSTM(
+            num_tokens_per_feature,
+            n_act,
+            n_pt,
+            emb_dim=args.emb,
+            hidden=args.hidden,
+            num_layers=args.layers,
+            dropout=args.drop
+        ).to(device)
+
+    def build_optimizer(model_obj):
+        if args.weight_decay > 0:
+            return torch.optim.AdamW(
+                model_obj.parameters(),
+                lr=args.lr,
+                weight_decay=args.weight_decay
+            )
+
+        return torch.optim.Adam(model_obj.parameters(), lr=args.lr)
+
+    def build_class_weights(yA_source, yP_source):
+        act_counts_local = np.bincount(yA_source[yA_source != -1].ravel(), minlength=n_act) + 1
+        pt_counts_local  = np.bincount(yP_source[yP_source != -1].ravel(), minlength=n_pt) + 1
+
+        act_w_local = torch.tensor(
+            1.0 / (act_counts_local ** args.action_weight_power),
+            dtype=torch.float32
+        )
+        act_w_local = act_w_local * (n_act / act_w_local.sum())
+
+        pt_w_local = torch.tensor(
+            1.0 / (pt_counts_local ** args.point_weight_power),
+            dtype=torch.float32
+        )
+        pt_w_local = pt_w_local * (n_pt / pt_w_local.sum())
+
+        return act_w_local, pt_w_local
+
     train = pd.read_csv(args.train).sort_values(["rally_uid", "strikeNumber"])
     test  = pd.read_csv(args.test).sort_values(["rally_uid", "strikeNumber"])
 
@@ -275,20 +314,7 @@ def main(args):
     if args.point_weight_power < 0:
         raise ValueError("point_weight_power must be non-negative")
 
-    act_counts = np.bincount(yA_tr[yA_tr != -1].ravel(), minlength=n_act) + 1
-    pt_counts  = np.bincount(yP_tr[yP_tr != -1].ravel(), minlength=n_pt) + 1
-
-    act_w = torch.tensor(
-        1.0 / (act_counts ** args.action_weight_power),
-        dtype=torch.float32
-    )
-    act_w = act_w * (n_act / act_w.sum())
-
-    pt_w = torch.tensor(
-        1.0 / (pt_counts ** args.point_weight_power),
-        dtype=torch.float32
-    )
-    pt_w = pt_w * (n_pt / pt_w.sum())
+    act_w, pt_w = build_class_weights(yA_tr, yP_tr)
 
     print(f"action_weight_power={args.action_weight_power:.3f}")
     print(f"point_weight_power={args.point_weight_power:.3f}")
@@ -322,15 +348,7 @@ def main(args):
     print("device:", device)
     print("model: MultiTaskLSTM V1.6 transition + action/point weight power")
 
-    model = MultiTaskLSTM(
-        num_tokens_per_feature,
-        n_act,
-        n_pt,
-        emb_dim=args.emb,
-        hidden=args.hidden,
-        num_layers=args.layers,
-        dropout=args.drop
-    ).to(device)
+    model = build_model()
 
     ce_action = nn.CrossEntropyLoss(ignore_index=-1, weight=act_w.to(device))
     ce_point  = nn.CrossEntropyLoss(ignore_index=-1, weight=pt_w.to(device))
@@ -362,9 +380,9 @@ def main(args):
     )
     print(f"last_action_w={args.last_action_w:.3f}, select_metric={args.select_metric}")
 
-    def compute_action_loss(logits, targets, lengths):
+    def compute_action_loss(logits, targets, lengths, ce_action_fn):
         """Action loss over all valid timesteps, optionally mixed with last-timestep action loss."""
-        action_loss_all = ce_action(
+        action_loss_all = ce_action_fn(
             logits.reshape(-1, logits.size(-1)),
             targets.reshape(-1)
         )
@@ -374,7 +392,7 @@ def main(args):
 
         bidx = torch.arange(targets.size(0), device=targets.device)
         last_pos = (lengths - 1).clamp(min=0)
-        action_loss_last = ce_action(
+        action_loss_last = ce_action_fn(
             logits[bidx, last_pos],
             targets[bidx, last_pos]
         )
@@ -408,7 +426,7 @@ def main(args):
 
             la, lp, lr = model(Xb, Lb)
 
-            action_loss = compute_action_loss(la, yAb, Lb)
+            action_loss = compute_action_loss(la, yAb, Lb, ce_action)
             point_loss = ce_point(lp.reshape(-1, lp.size(-1)), yPb.reshape(-1))
             rally_loss = bce_rally(lr, yRb)
 
@@ -443,7 +461,7 @@ def main(args):
 
                 la, lp, lr = model(Xb, Lb)
 
-                action_loss = compute_action_loss(la, yAb, Lb)
+                action_loss = compute_action_loss(la, yAb, Lb, ce_action)
                 point_loss = ce_point(lp.reshape(-1, lp.size(-1)), yPb.reshape(-1))
                 rally_loss = bce_rally(lr, yRb)
 
@@ -550,6 +568,73 @@ def main(args):
             f"F1_point={best_metrics['f1_point']:.4f}, AUC={best_metrics['auc']:.4f}"
         )
 
+    if args.refit_full:
+        refit_epochs = args.refit_epochs if args.refit_epochs > 0 else best_epoch
+        if refit_epochs <= 0:
+            raise ValueError("refit_epochs must be positive after resolving best_epoch")
+
+        print("Refit full training enabled.")
+        print(f"refit_epochs={refit_epochs}")
+
+        full_train_ds = RallyDataset(X_all, yA_all, yP_all, yR_all, L_all)
+        print(f"full_train_samples={len(full_train_ds)}")
+
+        refit_generator = torch.Generator()
+        refit_generator.manual_seed(args.seed)
+
+        full_train_loader = DataLoader(
+            full_train_ds,
+            batch_size=args.batch,
+            shuffle=True,
+            generator=refit_generator
+        )
+
+        full_act_w, full_pt_w = build_class_weights(yA_all, yP_all)
+
+        refit_ce_action = nn.CrossEntropyLoss(ignore_index=-1, weight=full_act_w.to(device))
+        refit_ce_point  = nn.CrossEntropyLoss(ignore_index=-1, weight=full_pt_w.to(device))
+        refit_bce_rally = nn.BCEWithLogitsLoss()
+
+        set_seed(args.seed)
+        model = build_model()
+        opt = build_optimizer(model)
+
+        for ep in range(1, refit_epochs + 1):
+            model.train()
+            run_loss = 0.0
+
+            for Xb, yAb, yPb, yRb, Lb in full_train_loader:
+                Xb = Xb.to(device)
+                yAb = yAb.to(device)
+                yPb = yPb.to(device)
+                yRb = yRb.to(device)
+                Lb = Lb.to(device)
+
+                opt.zero_grad()
+
+                la, lp, lr = model(Xb, Lb)
+
+                action_loss = compute_action_loss(la, yAb, Lb, refit_ce_action)
+                point_loss = refit_ce_point(lp.reshape(-1, lp.size(-1)), yPb.reshape(-1))
+                rally_loss = refit_bce_rally(lr, yRb)
+
+                loss = (
+                    action_loss_w * action_loss
+                    + point_loss_w * point_loss
+                    + rally_loss_w * rally_loss
+                )
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+                run_loss += loss.item() * Xb.size(0)
+
+            tr_loss = run_loss / len(full_train_loader.dataset)
+            print(f"[Refit Epoch {ep}/{refit_epochs}] train_loss={tr_loss:.4f}")
+
+        model.eval()
+
     # inference
     def pad2d_cap(a, m, pad_val=PAD_TOKEN):
         out = np.full((m, a.shape[1]), pad_val, dtype=np.int64)
@@ -618,6 +703,8 @@ if __name__ == "__main__":
     ap.add_argument("--split_seed", type=int, default=42)
     ap.add_argument("--action_weight_power", type=float, default=1.0)
     ap.add_argument("--point_weight_power", type=float, default=1.0)
+    ap.add_argument("--refit_full", action="store_true")
+    ap.add_argument("--refit_epochs", type=int, default=0)
 
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch", type=int, default=64)

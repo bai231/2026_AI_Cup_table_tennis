@@ -567,12 +567,13 @@ rally_w  = 0.10
 
 ---
 
-## 目前最佳設定
+## Refit Full Training 實驗更新
 
-目前暫定最佳 full model 設定：
+新增 `--refit_full` 功能後，模型會先使用 validation 選出最佳 epoch，再用完整 `train.csv` 重新訓練一次，最後輸出 submission。
+
+目前最佳設定：
 
 ```text
-V1.6 Action Transition Head
 action_weight_power = 0.5
 point_weight_power  = 0.75
 action_w = 0.45
@@ -580,13 +581,13 @@ point_w  = 0.45
 rally_w  = 0.10
 seed = 42
 split_seed = 42
-lr = 0.001
-```
+select_metric = final
+
 
 目前主力 submission 檔案：
 
 ```text
-submission_action_awp050_pwp075_tw4510_seed42.csv
+submission_action_refit_full_best.csv
 ```
 
 ---
@@ -604,30 +605,10 @@ python baseline_action_without_slice.py \
   --action_w 0.45 \
   --point_w 0.45 \
   --rally_w 0.10 \
-  --out submission_action_awp050_pwp075_tw4510_seed42.csv
+  --refit_full \
+  --out submission_action_refit_full_best.csv
 ```
 
----
-
-## 平台測試狀態
-
-目前因提交次數限制，已知：
-
-```text
-submission_action_awp050_seed42.csv
-```
-
-平台分數高於原本 V1.6 full submission。
-
-目前最佳本地 validation 版本：
-
-```text
-submission_action_awp050_pwp075_tw4510_seed42.csv
-```
-
-尚待平台正式確認。
-
----
 
 ## 今日未採用實驗紀錄
 

@@ -1413,6 +1413,86 @@ soft_ensemble_probs.py
 
 ---
 
+## 2026-05-17
+
+# 更新紀錄：T3 奇偶洩漏修正（baseline_auc_sliced.py / baseline_auc_without_sliced.py）
+
+本次針對 Task 3（serverGetPoint AUC）的兩支腳本移除所有奇偶相關的資料洩漏，使模型只依賴球種、落點、球員靜態屬性等合法資訊進行預測。
+
+---
+
+## 修正的問題
+
+### 1. 移除 `strikeNumber` / `rally_length` / `server_is_next`
+
+這三欄位均與拍序奇偶直接相關，保留任一欄均可近乎完美地還原「當前擊球者是 server 還是 receiver」：
+
+```python
+DROP_COLS_T3 = ["strikeNumber", "rally_length", "server_is_next"]
+```
+
+移除後 AUC：0.999 → 0.836
+
+---
+
+### 2. 以 `score_leader` / `score_trailer` 取代 `scoreSelf` / `scoreOther`
+
+`scoreSelf` 與 `scoreOther` 以「當前擊球者視角」記錄比分，每換拍就對調（0,1 ↔ 1,0），等同編碼了拍序奇偶。
+
+改為不帶方向的比分表示：
+
+```python
+df["score_leader"]  = df[["scoreSelf", "scoreOther"]].max(axis=1)
+df["score_trailer"] = df[["scoreSelf", "scoreOther"]].min(axis=1)
+```
+
+移除後 AUC：0.836 → 0.814
+
+---
+
+### 3. 對齊 test_new 序列長度分布（僅 `baseline_auc_sliced.py`）
+
+原本 `SPLIT_THRESHOLD=7`，訓練 prefix 最短 7 拍；但 test_new 中位數只有 2 拍，54% 不超過 2 拍，造成嚴重的 out-of-distribution 問題。
+
+改為從第 1 拍開始切，每場 rally 產生長度 1 ~ len-1 的所有 prefix：
+
+```python
+for cut_end in range(1, len(g)):   # 原本 range(SPLIT_THRESHOLD, len(g))
+```
+
+調整後 AUC：0.814 → 0.519（誠實反映短序列難以預測的事實）
+
+---
+
+## 修正後的 FEATURES（共 10 個）
+
+```python
+FEATURES = [
+    "sex", "handId", "strengthId", "spinId",
+    "pointId", "actionId", "positionId", "strikeId",
+    "score_leader", "score_trailer",
+]
+```
+
+---
+
+## 目前 T3 主力指令
+
+```bash
+python baseline_auc_sliced.py --select_metric auc
+```
+
+輸出：`submission_sliced_auc.csv`，val AUC ≈ 0.519（無洩漏）
+
+---
+
+## 備注
+
+- `baseline_auc_without_sliced.py` 同樣移除了奇偶欄位，但未修正序列長度分布問題（隱性洩漏：序列長度 = rally_length - 1），不建議作為主力提交。
+- 目前主力 T3 submission 來自 `baseline_auc_sliced.py`。
+
+---
+
 # 目前正式主力指令
 
 ```bash
@@ -1432,33 +1512,3 @@ python baseline_action_without_slice.py \
   --out submission_action_pwp070_refit_full.csv
 ```
 
----
-
-# GitHub 更新建議
-
-本次建議加入：
-
-```text
-baseline_action_without_slice.py
-soft_ensemble_probs.py
-merge_submission_three_models.py
-README / CHANGELOG
-```
-
-不建議加入：
-
-```text
-submission_*.csv
-probs_*.npz
-kfold_*.csv
-__pycache__/
-```
-
-提交指令範例：
-
-```bash
-git add baseline_action_without_slice.py soft_ensemble_probs.py merge_submission_three_models.py README.md
-git commit -m "feat: improve action model training and add evaluation utilities"
-git pull --rebase origin main
-git push origin main
-```

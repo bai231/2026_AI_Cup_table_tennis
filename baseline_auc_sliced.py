@@ -16,8 +16,15 @@ torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 FEATURES = [
     "sex", "handId", "strengthId", "spinId",
     "pointId", "actionId", "positionId", "strikeId",
-    "scoreSelf", "scoreOther", "strikeNumber",
+    "score_leader", "score_trailer",
 ]
+
+# [T3-LEAK-FIX] 移除所有奇偶相關欄位，模型只能依落點/球種/球員靜態屬性判斷 serverGetPoint：
+# - strikeNumber：拍序編號，其奇偶直接決定當拍擊球方（server/receiver），是奇偶洩漏的根源；
+#   在未切割版本中序列末端值 = rally_length - 1，同時洩漏賽局總長。
+# - rally_length：賽局總拍數，奇偶幾乎 100% 決定 serverGetPoint（AUC=0.9994），test_new 截斷後失效。
+# - server_is_next：等同 (strikeNumber+1)%2==1，與上兩欄同源的奇偶衍生欄位。
+DROP_COLS_T3 = ["strikeNumber", "rally_length", "server_is_next"]
 
 PAD_TOKEN = 0
 ACTION_FEATURE_IDX = FEATURES.index("actionId")
@@ -154,12 +161,19 @@ def main(args):
     train = pd.read_csv(args.train).sort_values(["rally_uid", "strikeNumber"])
     test  = pd.read_csv(args.test).sort_values(["rally_uid", "strikeNumber"])
 
+    # [T3-LEAK-FIX] 移除所有奇偶洩漏欄位（sort 已完成，strikeNumber 不再需要保留）。
+    # strikeNumber 實際存在於 CSV，此處真正刪除；rally_length / server_is_next 為防護性呼叫。
+    train = train.drop(columns=[c for c in DROP_COLS_T3 if c in train.columns])
+    test  = test.drop(columns=[c for c in DROP_COLS_T3 if c in test.columns])
+
+    # [T3-LEAK-FIX] scoreSelf/scoreOther 以擊球者視角紀錄，每換拍數值對調，等同編碼奇偶。
+    # 改用不帶方向的比分：score_leader = max，score_trailer = min，消除奇偶資訊。
+    for df in [train, test]:
+        df["score_leader"]  = df[["scoreSelf", "scoreOther"]].max(axis=1)
+        df["score_trailer"] = df[["scoreSelf", "scoreOther"]].min(axis=1)
+
     print("train shape:", train.shape)
     print("test shape:", test.shape)
-
-    # 把每回合球數限制在某個區段
-    train["strikeNumber"] = train["strikeNumber"].clip(0, 40)
-    test["strikeNumber"]  = test["strikeNumber"].clip(0, 40)
 
     # 把資料換成統一編碼
     # 0 保留給 padding。
@@ -199,11 +213,9 @@ def main(args):
 
     X_list, yA_list, yP_list, yR_list, L_list, rid_list = [], [], [], [], [], []
 
-    # AUC 專用切法：保留短回合，長回合才切割。
-    # 如果 rally 長度 > SPLIT_THRESHOLD：從長度 7 開始切到 len(g)-1。
-    # 如果 rally 長度 <= SPLIT_THRESHOLD：不切，維持原始 baseline 的一筆資料。
-    SPLIT_THRESHOLD = 7
-
+    # [T3-LEAK-FIX] test_new 的序列長度中位數為 2 拍，72% 不超過 4 拍。
+    # 原本 SPLIT_THRESHOLD=7 導致模型幾乎沒見過短序列，造成 out-of-distribution 推論。
+    # 改為從第 1 拍開始切，讓每場 rally 產生 prefix 長度 1 ~ len(g)-1 的所有樣本。
     for rid, g in train.groupby("rally_uid"):
         if len(g) < 2:
             continue
@@ -213,29 +225,10 @@ def main(args):
         yP_full = g["pointId"].values.astype(np.int64)
         yR = int(g["serverGetPoint"].iloc[0])
 
-        if len(g) > SPLIT_THRESHOLD:
-            # 例如 len(g)=10：
-            # cut_end=7 -> X=1~7, y=2~8
-            # cut_end=8 -> X=1~8, y=2~9
-            # cut_end=9 -> X=1~9, y=2~10
-            # 注意不能切到 cut_end=len(g)，因為沒有下一拍當 label。
-            for cut_end in range(SPLIT_THRESHOLD, len(g)):
-                X = X_full[:cut_end]
-                yA = yA_full[1:cut_end + 1]
-                yP = yP_full[1:cut_end + 1]
-
-                X_list.append(X)
-                yA_list.append(yA)
-                yP_list.append(yP)
-
-                yR_list.append(yR)
-                L_list.append(len(X))
-                rid_list.append(rid)
-        else:
-            # 長度 <= 7 的 rally 不切，保留原始一筆：X=1~n-1, y=2~n。
-            X = X_full[:-1]
-            yA = yA_full[1:]
-            yP = yP_full[1:]
+        for cut_end in range(1, len(g)):
+            X = X_full[:cut_end]
+            yA = yA_full[1:cut_end + 1]
+            yP = yP_full[1:cut_end + 1]
 
             X_list.append(X)
             yA_list.append(yA)

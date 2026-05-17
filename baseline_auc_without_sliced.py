@@ -16,8 +16,15 @@ torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
 FEATURES = [
     "sex", "handId", "strengthId", "spinId",
     "pointId", "actionId", "positionId", "strikeId",
-    "scoreSelf", "scoreOther", "strikeNumber",
+    "score_leader", "score_trailer",
 ]
+
+# [T3-LEAK-FIX] 移除所有奇偶相關欄位，模型只能依落點/球種/球員靜態屬性判斷 serverGetPoint：
+# - strikeNumber：拍序編號，其奇偶直接決定當拍擊球方（server/receiver），是奇偶洩漏的根源；
+#   在未切割版本中序列末端值 = rally_length - 1，同時洩漏賽局總長。
+# - rally_length：賽局總拍數，奇偶幾乎 100% 決定 serverGetPoint（AUC=0.9994），test_new 截斷後失效。
+# - server_is_next：等同 (strikeNumber+1)%2==1，與上兩欄同源的奇偶衍生欄位。
+DROP_COLS_T3 = ["strikeNumber", "rally_length", "server_is_next"]
 
 PAD_TOKEN = 0
 ACTION_FEATURE_IDX = FEATURES.index("actionId")
@@ -154,12 +161,20 @@ def main(args):
     train = pd.read_csv(args.train).sort_values(["rally_uid", "strikeNumber"])
     test  = pd.read_csv(args.test).sort_values(["rally_uid", "strikeNumber"])
 
+    # [T3-LEAK-FIX] 移除所有奇偶洩漏欄位（sort 已完成，strikeNumber 不再需要保留）。
+    # strikeNumber 實際存在於 CSV，此處真正刪除；rally_length / server_is_next 為防護性呼叫。
+    # 此防護同時覆蓋推論階段：test 於 groupby 前已清除，encode_frame 自動安全。
+    train = train.drop(columns=[c for c in DROP_COLS_T3 if c in train.columns])
+    test  = test.drop(columns=[c for c in DROP_COLS_T3 if c in test.columns])
+
+    # [T3-LEAK-FIX] scoreSelf/scoreOther 以擊球者視角紀錄，每換拍數值對調，等同編碼奇偶。
+    # 改用不帶方向的比分：score_leader = max，score_trailer = min，消除奇偶資訊。
+    for df in [train, test]:
+        df["score_leader"]  = df[["scoreSelf", "scoreOther"]].max(axis=1)
+        df["score_trailer"] = df[["scoreSelf", "scoreOther"]].min(axis=1)
+
     print("train shape:", train.shape)
     print("test shape:", test.shape)
-
-    # 把每回合球數限制在某個區段
-    train["strikeNumber"] = train["strikeNumber"].clip(0, 40)
-    test["strikeNumber"]  = test["strikeNumber"].clip(0, 40)
 
     # 把資料換成統一編碼
     # 0 保留給 padding。

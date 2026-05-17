@@ -17,7 +17,11 @@ FEATURES = [
     "sex", "handId", "strengthId", "spinId",
     "pointId", "actionId", "positionId", "strikeId",
     "score_leader", "score_trailer",
+    "server_wr_bin", "other_wr_bin",
 ]
+
+# 球員發球勝率分桶數（0 ~ N_WR_BINS-1）
+N_WR_BINS = 10
 
 # [T3-LEAK-FIX] 移除所有奇偶相關欄位，模型只能依落點/球種/球員靜態屬性判斷 serverGetPoint：
 # - strikeNumber：拍序編號，其奇偶直接決定當拍擊球方（server/receiver），是奇偶洩漏的根源；
@@ -172,8 +176,33 @@ def main(args):
         df["score_leader"]  = df[["scoreSelf", "scoreOther"]].max(axis=1)
         df["score_trailer"] = df[["scoreSelf", "scoreOther"]].min(axis=1)
 
+    # Plan A（勝率版）：從 train 計算各球員擔任發球方時的勝率，分成 N_WR_BINS 個 bin。
+    # 資料已按 strikeNumber 排序後才刪欄，第一列 = 發球拍，gamePlayerId = 本場發球方。
+    # 未知球員（test 中未出現於 train）→ 填入全局平均勝率，不引入零值偏誤。
+    N_WR_BINS = args.n_wr_bins
+
+    train_first = train.groupby("rally_uid")[["gamePlayerId", "gamePlayerOtherId", "serverGetPoint"]].first()
+    player_wr = train_first.groupby("gamePlayerId")["serverGetPoint"].mean()
+    global_wr = float(train_first["serverGetPoint"].mean())
+
+    def get_wr_bin(pid):
+        try:
+            wr = player_wr.get(int(pid), global_wr)
+        except (ValueError, TypeError):
+            wr = global_wr
+        return min(int(wr * N_WR_BINS), N_WR_BINS - 1)
+
+    for df, label in [(train, "train"), (test, "test")]:
+        first = df.groupby("rally_uid")[["gamePlayerId", "gamePlayerOtherId"]].first()
+        wr_df = pd.DataFrame({
+            "server_wr_bin": first["gamePlayerId"].map(get_wr_bin),
+            "other_wr_bin":  first["gamePlayerOtherId"].map(get_wr_bin),
+        })
+        df[["server_wr_bin", "other_wr_bin"]] = wr_df.reindex(df["rally_uid"].values).values
+
     print("train shape:", train.shape)
     print("test shape:", test.shape)
+    print(f"global server win rate: {global_wr:.3f}, n_players (train): {len(player_wr)}")
 
     # 把資料換成統一編碼
     # 0 保留給 padding。
@@ -332,7 +361,7 @@ def main(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
-    print("model: MultiTaskLSTM V1.6 transition (original LSTM + Action Transition Head + adjustable loss weights)")
+    print("model: MultiTaskLSTM V1.6 transition + Plan A player win rate bins")
 
     model = MultiTaskLSTM(
         num_tokens_per_feature,
@@ -341,7 +370,7 @@ def main(args):
         emb_dim=args.emb,
         hidden=args.hidden,
         num_layers=args.layers,
-        dropout=args.drop
+        dropout=args.drop,
     ).to(device)
 
     ce_action = nn.CrossEntropyLoss(ignore_index=-1, weight=act_w.to(device))
@@ -661,6 +690,9 @@ if __name__ == "__main__":
     # 0 表示不啟用 early stopping
     # 例如 --patience 2 代表連續 2 輪沒進步就停止
     ap.add_argument("--patience", type=int, default=0)
+
+    # Plan A: 球員勝率分桶數（預設 10）
+    ap.add_argument("--n_wr_bins", type=int, default=10)
 
     args = ap.parse_args()
 

@@ -1476,16 +1476,6 @@ FEATURES = [
 
 ---
 
-## 目前 T3 主力指令
-
-```bash
-python baseline_auc_sliced.py --select_metric auc
-```
-
-輸出：`submission_sliced_auc.csv`，val AUC ≈ 0.519（無洩漏）
-
----
-
 ## 備注
 
 - `baseline_auc_without_sliced.py` 同樣移除了奇偶欄位，但未修正序列長度分布問題（隱性洩漏：序列長度 = rally_length - 1），不建議作為主力提交。
@@ -1493,22 +1483,74 @@ python baseline_auc_sliced.py --select_metric auc
 
 ---
 
-# 目前正式主力指令
+## 2026-05-17（續）
+
+# 更新紀錄：T3 加入球員發球勝率特徵（baseline_auc_sliced.py）
+
+本次針對 `baseline_auc_sliced.py` 加入球員歷史資訊，目標是利用 train 中球員發球勝率差異提升 serverGetPoint AUC。
+
+---
+
+## 嘗試過但棄用：球員 ID Embedding
+
+首先嘗試將 `gamePlayerId`（發球方）與 `gamePlayerOtherId`（接球方）各建一個 `nn.Embedding`，concat 到 `mean_hidden` 後接 `rly_head`。
+
+結果：
+
+| 設定 | Best val AUC |
+|---|---|
+| emb_dim=8 | 0.5496 |
+| emb_dim=8 + weight_decay=1e-3 | 0.5498 |
+| emb_dim=4 | 0.5494 |
+
+166 個球員各有獨立參數，val_loss 在所有設定中均持續上升，過擬合嚴重，放棄此方向。
+
+---
+
+## 採用：球員發球勝率 Bin
+
+改用預計算方式：從 train 計算每位球員擔任 server 時的平均勝率，分成 10 個 bin，作為普通 FEATURES 欄位加入 LSTM 輸入。
+
+- 只有 10 個 bin（不是 166 個球員），大幅降低過擬合風險
+- 模型架構不變，沒有新增任何參數
+- 未知球員填入全局平均勝率（≈ 0.55），對應 bin 5
+
+新增兩個 FEATURES：
+
+```python
+"server_wr_bin",  # 發球方歷史發球勝率 bin（0~9）
+"other_wr_bin",   # 接球方歷史發球勝率 bin（0~9）
+```
+
+完整 FEATURES（共 12 個）：
+
+```python
+FEATURES = [
+    "sex", "handId", "strengthId", "spinId",
+    "pointId", "actionId", "positionId", "strikeId",
+    "score_leader", "score_trailer",
+    "server_wr_bin", "other_wr_bin",
+]
+N_WR_BINS = 10
+```
+
+結果：
+
+| 設定 | Best val AUC |
+|---|---|
+| 無球員（前版）| 0.519 |
+| 勝率 bin（本次）| **0.5523** |
+
+**AUC 變化**：0.519 → **0.5523**（+0.033）
+
+---
+
+## 目前 T3 主力指令
 
 ```bash
-python baseline_action_without_slice.py \
-  --seed 42 \
-  --split_seed 42 \
-  --epochs 10 \
-  --select_metric final \
-  --class_weight_method power \
-  --action_weight_power 0.5 \
-  --point_weight_power 0.70 \
-  --class_weight_max 0 \
-  --action_w 0.45 \
-  --point_w 0.45 \
-  --rally_w 0.10 \
-  --refit_full \
-  --out submission_action_pwp070_refit_full.csv
+python baseline_auc_sliced.py --select_metric auc
 ```
+
+輸出：`submission_sliced_auc.csv`，val AUC ≈ 0.5523
+
 

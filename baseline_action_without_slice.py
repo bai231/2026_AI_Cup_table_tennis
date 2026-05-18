@@ -341,6 +341,33 @@ def build_action_transition_prior_from_arrays(
     return torch.tensor(log_prior, dtype=torch.float32)
 
 
+def make_class_weights(
+    counts,
+    n_classes,
+    method="power",
+    power=1.0,
+    effective_beta=0.999,
+    max_weight=0.0
+):
+    counts = counts.astype(np.float64)
+
+    if method == "power":
+        raw_w = 1.0 / (counts ** power)
+    elif method == "effective":
+        raw_w = (1.0 - effective_beta) / (1.0 - np.power(effective_beta, counts))
+    else:
+        raise ValueError(f"Unsupported class_weight_method: {method}")
+
+    w = torch.tensor(raw_w, dtype=torch.float32)
+    w = w * (n_classes / w.sum())
+
+    if max_weight is not None and max_weight > 0:
+        w = torch.clamp(w, max=max_weight)
+        w = w * (n_classes / w.sum())
+
+    return w
+
+
 def main(args):
     set_seed(args.seed)
     print("start to run code\n")
@@ -373,17 +400,23 @@ def main(args):
         act_counts_local = np.bincount(yA_source[yA_source != -1].ravel(), minlength=n_act) + 1
         pt_counts_local  = np.bincount(yP_source[yP_source != -1].ravel(), minlength=n_pt) + 1
 
-        act_w_local = torch.tensor(
-            1.0 / (act_counts_local ** args.action_weight_power),
-            dtype=torch.float32
+        act_w_local = make_class_weights(
+            act_counts_local,
+            n_act,
+            method=args.class_weight_method,
+            power=args.action_weight_power,
+            effective_beta=args.effective_beta,
+            max_weight=args.class_weight_max,
         )
-        act_w_local = act_w_local * (n_act / act_w_local.sum())
 
-        pt_w_local = torch.tensor(
-            1.0 / (pt_counts_local ** args.point_weight_power),
-            dtype=torch.float32
+        pt_w_local = make_class_weights(
+            pt_counts_local,
+            n_pt,
+            method=args.class_weight_method,
+            power=args.point_weight_power,
+            effective_beta=args.effective_beta,
+            max_weight=args.class_weight_max,
         )
-        pt_w_local = pt_w_local * (n_pt / pt_w_local.sum())
 
         return act_w_local, pt_w_local
 
@@ -601,6 +634,12 @@ def main(args):
     if args.point_weight_power < 0:
         raise ValueError("point_weight_power must be non-negative")
 
+    if not (0.0 < args.effective_beta < 1.0):
+        raise ValueError("effective_beta must be in (0, 1)")
+
+    if args.class_weight_max < 0:
+        raise ValueError("class_weight_max must be non-negative")
+
     if args.action_focal_gamma < 0:
         raise ValueError("action_focal_gamma must be non-negative")
 
@@ -630,8 +669,11 @@ def main(args):
 
     act_w, pt_w = build_class_weights(yA_tr, yP_tr)
 
+    print(f"class_weight_method={args.class_weight_method}")
     print(f"action_weight_power={args.action_weight_power:.3f}")
     print(f"point_weight_power={args.point_weight_power:.3f}")
+    print(f"effective_beta={args.effective_beta:.5f}")
+    print(f"class_weight_max={args.class_weight_max:.3f}")
     print(f"action_loss_type={args.action_loss_type}")
     print(f"action_focal_gamma={args.action_focal_gamma:.3f}")
     print(f"action_label_smoothing={args.action_label_smoothing:.3f}")
@@ -641,6 +683,12 @@ def main(args):
     print(f"prefix_aug={args.prefix_aug}")
     print(f"prefix_last_k={args.prefix_last_k}")
     print(f"prefix_min_len={args.prefix_min_len}")
+
+    if args.class_weight_method == "effective":
+        print("Using effective number class weights.")
+
+    if args.class_weight_max > 0:
+        print(f"Clipping class weights to max={args.class_weight_max}")
 
     # 建立資料集物件
     train_ds = RallyDataset(X_tr, yA_tr, yP_tr, yR_tr, L_tr)
@@ -1333,6 +1381,10 @@ def main(args):
 
     # 對 TEST 做預測
     pred_rows = []
+    prob_rally_uids = []
+    action_prob_rows = []
+    point_prob_rows = []
+    server_prob_rows = []
 
     model.eval()
 
@@ -1348,9 +1400,13 @@ def main(args):
 
             last_t = L_t.item() - 1
 
+            action_prob = torch.softmax(la[0, last_t], dim=-1)
+            point_prob = torch.softmax(lp[0, last_t], dim=-1)
+            server_prob = torch.sigmoid(lr).reshape(-1)[0]
+
             a_idx = int(torch.argmax(la[0, last_t]).item())
             p_idx = int(torch.argmax(lp[0, last_t]).item())
-            s_prob = float(torch.sigmoid(lr).item())
+            s_prob = float(server_prob.item())
 
             action_pred = int(act_classes[a_idx])
             point_pred = int(pt_classes[p_idx])
@@ -1361,6 +1417,12 @@ def main(args):
                 "pointId": point_pred,
                 "actionId": action_pred
             })
+
+            if args.save_prob_file:
+                prob_rally_uids.append(int(rid))
+                action_prob_rows.append(action_prob.detach().cpu().numpy().astype(np.float32))
+                point_prob_rows.append(point_prob.detach().cpu().numpy().astype(np.float32))
+                server_prob_rows.append(np.float32(s_prob))
 
     # 輸出
     pred_df = pd.DataFrame(pred_rows)
@@ -1373,11 +1435,50 @@ def main(args):
     if out[column_order].isna().any().any():
         print("WARNING: submission 裡面有 NaN，請檢查預測結果。")
 
+    if args.save_prob_file:
+        prob_rally_uids = np.array(prob_rally_uids, dtype=np.int64)
+        action_probs = np.stack(action_prob_rows).astype(np.float32)
+        point_probs = np.stack(point_prob_rows).astype(np.float32)
+        server_probs = np.array(server_prob_rows, dtype=np.float32)
+
+        sort_idx = np.argsort(prob_rally_uids)
+        prob_rally_uids = prob_rally_uids[sort_idx]
+        action_probs = action_probs[sort_idx]
+        point_probs = point_probs[sort_idx]
+        server_probs = server_probs[sort_idx]
+
+        submission_rally_uids = out["rally_uid"].to_numpy(dtype=np.int64)
+        if not np.array_equal(prob_rally_uids, submission_rally_uids):
+            raise ValueError("Probability rally_uid order does not match submission output.")
+
+        if (
+            np.isnan(action_probs).any()
+            or np.isnan(point_probs).any()
+            or np.isnan(server_probs).any()
+        ):
+            raise ValueError("Probability output contains NaN.")
+
+        np.savez_compressed(
+            args.save_prob_file,
+            rally_uid=prob_rally_uids,
+            action_classes=np.array(act_classes, dtype=np.int64),
+            point_classes=np.array(pt_classes, dtype=np.int64),
+            action_probs=action_probs,
+            point_probs=point_probs,
+            server_probs=server_probs,
+        )
+
     out.to_csv(args.out, index=False)
 
     print(f"Saved original action submission to: {args.out}")
     print("submission shape:", out.shape)
     print(out.head())
+
+    if args.save_prob_file:
+        print(f"Saved probability file to: {args.save_prob_file}")
+        print("action_probs shape:", action_probs.shape)
+        print("point_probs shape:", point_probs.shape)
+        print("server_probs shape:", server_probs.shape)
 
 
 if __name__ == "__main__":
@@ -1388,10 +1489,18 @@ if __name__ == "__main__":
     # 保留 --sample 只是為了相容舊指令；目前輸出直接使用 test 的 rally_uid，不再讀 sample_submission.csv。
     ap.add_argument("--sample", default="sample_submission.csv")
     ap.add_argument("--out", default="submission_original_action.csv")
+    ap.add_argument("--save_prob_file", default="")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--split_seed", type=int, default=42)
+    ap.add_argument(
+        "--class_weight_method",
+        choices=["power", "effective"],
+        default="power"
+    )
     ap.add_argument("--action_weight_power", type=float, default=1.0)
     ap.add_argument("--point_weight_power", type=float, default=1.0)
+    ap.add_argument("--effective_beta", type=float, default=0.999)
+    ap.add_argument("--class_weight_max", type=float, default=0.0)
     ap.add_argument("--action_loss_type", choices=["ce", "focal"], default="ce")
     ap.add_argument("--action_focal_gamma", type=float, default=1.0)
     ap.add_argument("--action_label_smoothing", type=float, default=0.0)

@@ -12,14 +12,41 @@ from sklearn.metrics import f1_score, roc_auc_score
 
 DEFAULT_SEED = 42
 
-FEATURES = [
+BASE_FEATURES = [
     "sex", "handId", "strengthId", "spinId",
     "pointId", "actionId", "positionId", "strikeId",
     "scoreSelf", "scoreOther", "strikeNumber",
 ]
 
 PAD_TOKEN = 0
-ACTION_FEATURE_IDX = FEATURES.index("actionId")
+
+
+def get_features(player_feature_mode, role_feature_mode):
+    features = list(BASE_FEATURES)
+
+    if player_feature_mode in ["current", "both"]:
+        features.append("gamePlayerId")
+
+    if player_feature_mode in ["opponent", "both"]:
+        features.append("gamePlayerOtherId")
+
+    if role_feature_mode in ["basic", "full"]:
+        features.extend([
+            "serverPlayerId",
+            "receiverPlayerId",
+            "isCurrentPlayerServer",
+        ])
+
+    if role_feature_mode == "full":
+        features.extend([
+            "serverScore",
+            "receiverScore",
+            "serverScoreDiff",
+            "serverIsLeading",
+            "serverIsTie",
+        ])
+
+    return features
 
 
 def set_seed(seed):
@@ -68,6 +95,7 @@ class MultiTaskLSTM(nn.Module):
         num_tokens_per_feature,
         n_act,
         n_pt,
+        action_feature_idx,
         emb_dim=16,
         hidden=128,
         num_layers=1,
@@ -96,11 +124,12 @@ class MultiTaskLSTM(nn.Module):
         self.act_head = nn.Linear(hidden, n_act)
         self.pt_head  = nn.Linear(hidden, n_pt)
         self.rly_head = nn.Linear(hidden, 1)
+        self.action_feature_idx = action_feature_idx
 
         # V1.6: current actionId token -> next actionId logits.
         # num_tokens_per_feature already contains the unknown-token id as max token id.
         self.act_transition = nn.Embedding(
-            num_tokens_per_feature[ACTION_FEATURE_IDX] + 1,
+            num_tokens_per_feature[action_feature_idx] + 1,
             n_act,
             padding_idx=PAD_TOKEN
         )
@@ -148,7 +177,7 @@ class MultiTaskLSTM(nn.Module):
         act_logits = self.act_head(o)
 
         # Action transition shortcut.
-        cur_action_token = X[:, :, ACTION_FEATURE_IDX]
+        cur_action_token = X[:, :, self.action_feature_idx]
         trans_logits = self.act_transition(cur_action_token)
         act_logits = act_logits + self.transition_scale * trans_logits
 
@@ -266,6 +295,43 @@ def add_score_features(df):
     return df
 
 
+def add_role_features(df):
+    df = df.copy()
+
+    first_rows = (
+        df.sort_values(["rally_uid", "strikeNumber"])
+        .groupby("rally_uid", as_index=False)
+        .first()[["rally_uid", "gamePlayerId", "gamePlayerOtherId"]]
+        .rename(columns={
+            "gamePlayerId": "serverPlayerId",
+            "gamePlayerOtherId": "receiverPlayerId",
+        })
+    )
+
+    df = df.merge(first_rows, on="rally_uid", how="left")
+
+    df["isCurrentPlayerServer"] = (
+        df["gamePlayerId"] == df["serverPlayerId"]
+    ).astype(int)
+
+    df["serverScore"] = np.where(
+        df["isCurrentPlayerServer"] == 1,
+        df["scoreSelf"],
+        df["scoreOther"]
+    )
+    df["receiverScore"] = np.where(
+        df["isCurrentPlayerServer"] == 1,
+        df["scoreOther"],
+        df["scoreSelf"]
+    )
+
+    df["serverScoreDiff"] = df["serverScore"] - df["receiverScore"]
+    df["serverIsLeading"] = (df["serverScore"] > df["receiverScore"]).astype(int)
+    df["serverIsTie"] = (df["serverScore"] == df["receiverScore"]).astype(int)
+
+    return df
+
+
 def add_rally_samples(
     X_list,
     yA_list,
@@ -313,12 +379,13 @@ def build_action_transition_prior_from_arrays(
     yA_arr,
     num_action_embeddings,
     n_act,
+    action_feature_idx,
     alpha=1.0,
     strength=1.0
 ):
     counts = np.zeros((num_action_embeddings, n_act), dtype=np.float64)
 
-    cur_tokens = X_arr[:, :, ACTION_FEATURE_IDX].reshape(-1)
+    cur_tokens = X_arr[:, :, action_feature_idx].reshape(-1)
     next_actions = yA_arr.reshape(-1)
     valid = (next_actions != -1) & (cur_tokens != PAD_TOKEN)
 
@@ -373,12 +440,18 @@ def main(args):
     print("start to run code\n")
     print(f"model seed: {args.seed}")
     print(f"split seed: {args.split_seed}")
+    features = get_features(args.player_feature_mode, args.role_feature_mode)
+    action_feature_idx = features.index("actionId")
+    print(f"player_feature_mode={args.player_feature_mode}")
+    print(f"role_feature_mode={args.role_feature_mode}")
+    print("features:", features)
 
     def build_model(action_transition_prior=None):
         return MultiTaskLSTM(
             num_tokens_per_feature,
             n_act,
             n_pt,
+            action_feature_idx=action_feature_idx,
             emb_dim=args.emb,
             hidden=args.hidden,
             num_layers=args.layers,
@@ -461,6 +534,9 @@ def main(args):
     train["strikeNumber"] = train["strikeNumber"].clip(0, 40)
     test["strikeNumber"]  = test["strikeNumber"].clip(0, 40)
 
+    if args.role_feature_mode != "none":
+        train = add_role_features(train)
+        test = add_role_features(test)
 
     # 把資料換成統一編碼
     # 0 保留給 padding。
@@ -469,23 +545,23 @@ def main(args):
     # 不再用 pd.Categorical(df[col], categories=...)，避免新版 pandas 對未知類別產生 Pandas4Warning。
     cats = {
         c: np.sort(train[c].dropna().unique())
-        for c in FEATURES
+        for c in features
     }
 
     cat_maps = {
         c: {v: i + 1 for i, v in enumerate(cats[c])}
-        for c in FEATURES
+        for c in features
     }
 
     unk_tokens = {
         c: len(cats[c]) + 1
-        for c in FEATURES
+        for c in features
     }
 
     def encode_frame(df):
         outs = []
 
-        for col in FEATURES:
+        for col in features:
             codes = (
                 df[col]
                 .map(cat_maps[col])
@@ -719,8 +795,8 @@ def main(args):
 
     # num_tokens_per_feature 裡的 n 代表該 feature 最大 token id
     # Embedding 會建立 0 ~ n
-    num_tokens_per_feature = [len(cats[c]) + 1 for c in FEATURES]
-    num_action_embeddings = num_tokens_per_feature[ACTION_FEATURE_IDX] + 1
+    num_tokens_per_feature = [len(cats[c]) + 1 for c in features]
+    num_action_embeddings = num_tokens_per_feature[action_feature_idx] + 1
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
@@ -733,6 +809,7 @@ def main(args):
             yA_tr,
             num_action_embeddings=num_action_embeddings,
             n_act=n_act,
+            action_feature_idx=action_feature_idx,
             alpha=args.transition_prior_alpha,
             strength=args.transition_prior_strength
         )
@@ -854,6 +931,7 @@ def main(args):
                 yA_train,
                 num_action_embeddings=num_action_embeddings,
                 n_act=n_act,
+                action_feature_idx=action_feature_idx,
                 alpha=args.transition_prior_alpha,
                 strength=args.transition_prior_strength
             )
@@ -1327,6 +1405,7 @@ def main(args):
                 yA_all,
                 num_action_embeddings=num_action_embeddings,
                 n_act=n_act,
+                action_feature_idx=action_feature_idx,
                 alpha=args.transition_prior_alpha,
                 strength=args.transition_prior_strength
             )
@@ -1490,6 +1569,16 @@ if __name__ == "__main__":
     ap.add_argument("--sample", default="sample_submission.csv")
     ap.add_argument("--out", default="submission_original_action.csv")
     ap.add_argument("--save_prob_file", default="")
+    ap.add_argument(
+        "--player_feature_mode",
+        choices=["none", "current", "opponent", "both"],
+        default="none"
+    )
+    ap.add_argument(
+        "--role_feature_mode",
+        choices=["none", "basic", "full"],
+        default="none"
+    )
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--split_seed", type=int, default=42)
     ap.add_argument(

@@ -21,7 +21,7 @@ BASE_FEATURES = [
 PAD_TOKEN = 0
 
 
-def get_features(player_feature_mode, role_feature_mode):
+def get_features(player_feature_mode, role_feature_mode, player_stats_mode):
     features = list(BASE_FEATURES)
 
     if player_feature_mode in ["current", "both"]:
@@ -44,6 +44,18 @@ def get_features(player_feature_mode, role_feature_mode):
             "serverScoreDiff",
             "serverIsLeading",
             "serverIsTie",
+        ])
+
+    if player_stats_mode == "basic":
+        features.extend([
+            "currentPlayerActionTop1",
+            "currentPlayerPointTop1",
+            "currentPlayerServerWinRateBin",
+            "currentPlayerCountBin",
+            "otherPlayerActionTop1",
+            "otherPlayerPointTop1",
+            "otherPlayerServerWinRateBin",
+            "otherPlayerCountBin",
         ])
 
     return features
@@ -332,6 +344,100 @@ def add_role_features(df):
     return df
 
 
+def bin_count(x):
+    if x <= 1:
+        return 0
+    if x <= 5:
+        return 1
+    if x <= 20:
+        return 2
+    if x <= 50:
+        return 3
+    if x <= 100:
+        return 4
+    return 5
+
+
+def bin_rate(x):
+    if x < 0.2:
+        return 0
+    if x < 0.4:
+        return 1
+    if x < 0.6:
+        return 2
+    if x < 0.8:
+        return 3
+    return 4
+
+
+def _mode_top1(series):
+    counts = series.value_counts()
+    if counts.empty:
+        return None
+    return counts.idxmax()
+
+
+def build_player_stats(source_df):
+    source_df = source_df.copy()
+
+    player_counts = source_df["gamePlayerId"].value_counts()
+    action_top1 = (
+        source_df.groupby("gamePlayerId")["actionId"]
+        .agg(_mode_top1)
+        .dropna()
+        .to_dict()
+    )
+    point_top1 = (
+        source_df.groupby("gamePlayerId")["pointId"]
+        .agg(_mode_top1)
+        .dropna()
+        .to_dict()
+    )
+
+    global_action_top1 = _mode_top1(source_df["actionId"])
+    global_point_top1 = _mode_top1(source_df["pointId"])
+
+    rally_server = (
+        source_df.sort_values(["rally_uid", "strikeNumber"])
+        .groupby("rally_uid", as_index=False)
+        .first()[["rally_uid", "gamePlayerId", "serverGetPoint"]]
+        .rename(columns={"gamePlayerId": "serverPlayerId"})
+    )
+
+    server_win_rate = rally_server.groupby("serverPlayerId")["serverGetPoint"].mean()
+    global_server_win_rate = float(rally_server["serverGetPoint"].mean())
+
+    return {
+        "action_top1": action_top1,
+        "point_top1": point_top1,
+        "server_win_rate_bin": {k: bin_rate(v) for k, v in server_win_rate.to_dict().items()},
+        "count_bin": {k: bin_count(v) for k, v in player_counts.to_dict().items()},
+        "global_action_top1": int(global_action_top1),
+        "global_point_top1": int(global_point_top1),
+        "global_server_win_rate_bin": int(bin_rate(global_server_win_rate)),
+        "global_count_bin": 0,
+    }
+
+
+def apply_player_stats_features(df, stats):
+    df = df.copy()
+
+    current_player = df["gamePlayerId"]
+    other_player = df["gamePlayerOtherId"]
+
+    df["currentPlayerActionTop1"] = current_player.map(stats["action_top1"]).fillna(stats["global_action_top1"]).astype(np.int64)
+    df["currentPlayerPointTop1"] = current_player.map(stats["point_top1"]).fillna(stats["global_point_top1"]).astype(np.int64)
+    df["currentPlayerServerWinRateBin"] = current_player.map(stats["server_win_rate_bin"]).fillna(stats["global_server_win_rate_bin"]).astype(np.int64)
+    df["currentPlayerCountBin"] = current_player.map(stats["count_bin"]).fillna(0).astype(np.int64)
+
+    df["otherPlayerActionTop1"] = other_player.map(stats["action_top1"]).fillna(stats["global_action_top1"]).astype(np.int64)
+    df["otherPlayerPointTop1"] = other_player.map(stats["point_top1"]).fillna(stats["global_point_top1"]).astype(np.int64)
+    df["otherPlayerServerWinRateBin"] = other_player.map(stats["server_win_rate_bin"]).fillna(stats["global_server_win_rate_bin"]).astype(np.int64)
+    df["otherPlayerCountBin"] = other_player.map(stats["count_bin"]).fillna(0).astype(np.int64)
+
+    return df
+
+
 def add_rally_samples(
     X_list,
     yA_list,
@@ -440,11 +546,15 @@ def main(args):
     print("start to run code\n")
     print(f"model seed: {args.seed}")
     print(f"split seed: {args.split_seed}")
-    features = get_features(args.player_feature_mode, args.role_feature_mode)
+    features = get_features(args.player_feature_mode, args.role_feature_mode, args.player_stats_mode)
     action_feature_idx = features.index("actionId")
     print(f"player_feature_mode={args.player_feature_mode}")
     print(f"role_feature_mode={args.role_feature_mode}")
+    print(f"player_stats_mode={args.player_stats_mode}")
     print("features:", features)
+
+    if args.player_stats_mode == "basic":
+        print("Using basic player historical stats.")
 
     def build_model(action_transition_prior=None):
         return MultiTaskLSTM(
@@ -537,6 +647,14 @@ def main(args):
     if args.role_feature_mode != "none":
         train = add_role_features(train)
         test = add_role_features(test)
+
+    train_base = train.copy()
+    test_base = test.copy()
+
+    if args.player_stats_mode == "basic":
+        temp_player_stats = build_player_stats(train_base)
+        train = apply_player_stats_features(train_base, temp_player_stats)
+        test = apply_player_stats_features(test_base, temp_player_stats)
 
     # 把資料換成統一編碼
     # 0 保留給 padding。
@@ -701,6 +819,120 @@ def main(args):
     X_all, yA_all, yP_all, yR_all, L_all, full_sample_rids = build_sample_arrays(
         valid_rids,
         use_prefix_aug=args.prefix_aug
+    )
+
+    def build_frame_bundle(fit_df, train_df, val_df=None, test_df=None):
+        train_proc = train_df.copy()
+        val_proc = None if val_df is None else val_df.copy()
+        test_proc = None if test_df is None else test_df.copy()
+
+        if args.player_stats_mode == "basic":
+            stats = build_player_stats(fit_df)
+            train_proc = apply_player_stats_features(train_proc, stats)
+            if val_proc is not None:
+                val_proc = apply_player_stats_features(val_proc, stats)
+            if test_proc is not None:
+                test_proc = apply_player_stats_features(test_proc, stats)
+
+        cats_local = {
+            c: np.sort(train_proc[c].dropna().unique())
+            for c in features
+        }
+        cat_maps_local = {
+            c: {v: i + 1 for i, v in enumerate(cats_local[c])}
+            for c in features
+        }
+        unk_tokens_local = {
+            c: len(cats_local[c]) + 1
+            for c in features
+        }
+
+        def encode_frame_local(df):
+            outs = []
+            for col in features:
+                codes = (
+                    df[col]
+                    .map(cat_maps_local[col])
+                    .fillna(unk_tokens_local[col])
+                    .astype(np.int64)
+                    .to_numpy()
+                )
+                outs.append(codes)
+            return np.stack(outs, axis=1)
+
+        return train_proc, val_proc, test_proc, cats_local, encode_frame_local
+
+    def build_rally_cache_local(df_local, encode_frame_fn):
+        rally_cache_local = {}
+        for rid, g in df_local.groupby("rally_uid"):
+            if len(g) < 2:
+                continue
+
+            X_full = encode_frame_fn(g)
+            yA_full = g["actionId"].values.astype(np.int64)
+            yP_full = g["pointId"].values.astype(np.int64)
+            yR = int(g["serverGetPoint"].iloc[0])
+
+            rally_cache_local[int(rid)] = (X_full, yA_full, yP_full, yR)
+
+        return rally_cache_local
+
+    def build_sample_arrays_from_cache_local(rally_cache_local, rids, use_prefix_aug):
+        X_list_aug, yA_list_aug, yP_list_aug = [], [], []
+        yR_list_aug, L_list_aug, rid_list_aug = [], [], []
+
+        for rid in rids:
+            add_rally_samples(
+                X_list_aug,
+                yA_list_aug,
+                yP_list_aug,
+                yR_list_aug,
+                L_list_aug,
+                rid_list_aug,
+                int(rid),
+                rally_cache_local[int(rid)],
+                use_prefix_aug=use_prefix_aug,
+                prefix_last_k=args.prefix_last_k,
+                prefix_min_len=args.prefix_min_len
+            )
+
+        if not X_list_aug:
+            raise ValueError("No training samples were built. Check prefix augmentation settings.")
+
+        X_arr = np.stack([pad2d(s, MAXLEN) for s in X_list_aug])
+        yA_arr = np.stack([pad1d(s, MAXLEN) for s in yA_list_aug])
+        yP_arr = np.stack([pad1d(s, MAXLEN) for s in yP_list_aug])
+        yR_arr = np.array(yR_list_aug, dtype=np.float32)
+        L_arr = np.array(L_list_aug, dtype=np.int64)
+        rid_arr = np.array(rid_list_aug, dtype=np.int64)
+
+        yA_arr = np.vectorize(act_id2idx.get)(yA_arr, -1)
+        yP_arr = np.vectorize(pt_id2idx.get)(yP_arr, -1)
+
+        return X_arr, yA_arr, yP_arr, yR_arr, L_arr, rid_arr
+
+    train_raw_split = train_base[train_base["rally_uid"].isin(tr_rids)].copy()
+    val_raw_split = train_base[train_base["rally_uid"].isin(va_rids)].copy()
+
+    train_proc_main, val_proc_main, test_for_inference, cats, encode_frame = build_frame_bundle(
+        train_raw_split,
+        train_raw_split,
+        val_raw_split,
+        test_base
+    )
+
+    train_rally_cache_main = build_rally_cache_local(train_proc_main, encode_frame)
+    val_rally_cache_main = build_rally_cache_local(val_proc_main, encode_frame)
+
+    X_tr, yA_tr, yP_tr, yR_tr, L_tr, train_sample_rids = build_sample_arrays_from_cache_local(
+        train_rally_cache_main,
+        tr_rids,
+        use_prefix_aug=args.prefix_aug
+    )
+    X_va, yA_va, yP_va, yR_va, L_va, val_sample_rids = build_sample_arrays_from_cache_local(
+        val_rally_cache_main,
+        va_rids,
+        use_prefix_aug=False
     )
 
     # 計算權重
@@ -1145,11 +1377,29 @@ def main(args):
             fold_tr_rids = valid_rids[train_idx]
             fold_va_rids = valid_rids[val_idx]
 
-            X_tr_fold, yA_tr_fold, yP_tr_fold, yR_tr_fold, L_tr_fold, _ = build_sample_arrays(
+            fold_train_raw = train_base[train_base["rally_uid"].isin(fold_tr_rids)].copy()
+            fold_val_raw = train_base[train_base["rally_uid"].isin(fold_va_rids)].copy()
+
+            fold_train_proc, fold_val_proc, _, fold_cats, fold_encode_frame = build_frame_bundle(
+                fold_train_raw,
+                fold_train_raw,
+                fold_val_raw,
+                None
+            )
+
+            num_tokens_per_feature = [len(fold_cats[c]) + 1 for c in features]
+            num_action_embeddings = num_tokens_per_feature[action_feature_idx] + 1
+
+            fold_train_cache = build_rally_cache_local(fold_train_proc, fold_encode_frame)
+            fold_val_cache = build_rally_cache_local(fold_val_proc, fold_encode_frame)
+
+            X_tr_fold, yA_tr_fold, yP_tr_fold, yR_tr_fold, L_tr_fold, _ = build_sample_arrays_from_cache_local(
+                fold_train_cache,
                 fold_tr_rids,
                 use_prefix_aug=args.prefix_aug
             )
-            X_va_fold, yA_va_fold, yP_va_fold, yR_va_fold, L_va_fold, _ = build_sample_arrays(
+            X_va_fold, yA_va_fold, yP_va_fold, yR_va_fold, L_va_fold, _ = build_sample_arrays_from_cache_local(
+                fold_val_cache,
                 fold_va_rids,
                 use_prefix_aug=False
             )
@@ -1379,6 +1629,22 @@ def main(args):
         print("Refit full training enabled.")
         print(f"refit_epochs={refit_epochs}")
 
+        full_train_raw = train_base.copy()
+        full_train_proc, _, test_for_inference, cats, encode_frame = build_frame_bundle(
+            full_train_raw,
+            full_train_raw,
+            None,
+            test_base
+        )
+        num_tokens_per_feature = [len(cats[c]) + 1 for c in features]
+        num_action_embeddings = num_tokens_per_feature[action_feature_idx] + 1
+        full_train_cache = build_rally_cache_local(full_train_proc, encode_frame)
+        X_all, yA_all, yP_all, yR_all, L_all, full_sample_rids = build_sample_arrays_from_cache_local(
+            full_train_cache,
+            valid_rids,
+            use_prefix_aug=args.prefix_aug
+        )
+
         full_train_ds = RallyDataset(X_all, yA_all, yP_all, yR_all, L_all)
         print(f"full_train_samples={len(full_train_ds)}")
 
@@ -1468,7 +1734,7 @@ def main(args):
     model.eval()
 
     with torch.no_grad():
-        for rid, g in test.groupby("rally_uid"):
+        for rid, g in test_for_inference.groupby("rally_uid"):
             Xg = encode_frame(g)
             Xp, T = pad2d_cap(Xg, MAXLEN)
 
@@ -1577,6 +1843,11 @@ if __name__ == "__main__":
     ap.add_argument(
         "--role_feature_mode",
         choices=["none", "basic", "full"],
+        default="none"
+    )
+    ap.add_argument(
+        "--player_stats_mode",
+        choices=["none", "basic"],
         default="none"
     )
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)

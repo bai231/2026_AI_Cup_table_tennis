@@ -2070,61 +2070,7 @@ K-Fold 中 `role_feature_mode=basic` 的 best epoch 分布大約落在：
 
 因此使用中位數附近的 epoch 9 做手動 refit：
 
-```bash
-python baseline_action_without_slice.py \
-  --seed 42 \
-  --split_seed 42 \
-  --epochs 12 \
-  --select_metric final \
-  --player_feature_mode both \
-  --role_feature_mode basic \
-  --class_weight_method power \
-  --action_weight_power 0.5 \
-  --point_weight_power 0.70 \
-  --class_weight_max 0 \
-  --action_w 0.45 \
-  --point_w 0.45 \
-  --rally_w 0.10 \
-  --refit_full \
-  --refit_epochs 9 \
-  --out submission_action_player_both_role_basic_refit_ep9.csv \
-  --save_prob_file probs_action_player_both_role_basic_refit_ep9.npz
-```
 
-平台分數：
-
-```text
-0.333511
-```
-
-此版本成為目前平台最高版本。
-
----
-
-# 4. 目前最佳版本
-
-目前最佳 submission：
-
-```text
-submission_action_player_both_role_basic_refit_ep9.csv
-```
-
-目前最佳設定：
-
-```text
-V1.6 Action Transition Head
-+ player_feature_mode = both
-+ role_feature_mode = basic
-+ class_weight_method = power
-+ action_weight_power = 0.5
-+ point_weight_power = 0.70
-+ class_weight_max = 0
-+ action_w = 0.45
-+ point_w = 0.45
-+ rally_w = 0.10
-+ refit_full
-+ refit_epochs = 9
-```
 
 ---
 
@@ -2152,7 +2098,221 @@ role_feature_mode = full
 
 ---
 
-# 6. 目前正式主力指令
+# 更新紀錄：Player Historical Stats Basic
+
+本次更新主要針對 `baseline_action_without_slice.py`，在既有的 player / role feature 基礎上，新增 **Player Historical Stats Basic**，讓模型可以利用球員過去的打法統計特徵進行預測。
+
+---
+
+## 目前平台最佳版本
+
+目前平台實測最高版本為：
+
+```text
+submission_action_player_stats_basic_refit_ep10.csv
+```
+
+平台分數：
+
+```text
+0.3459151
+```
+
+目前最佳設定：
+
+```text
+V1.6 Action Transition Head
++ player_feature_mode = both
++ role_feature_mode = basic
++ player_stats_mode = basic
++ class_weight_method = power
++ action_weight_power = 0.5
++ point_weight_power = 0.70
++ class_weight_max = 0
++ action_w = 0.45
++ point_w = 0.45
++ rally_w = 0.10
++ refit_full
++ refit_epochs = 10
+```
+
+---
+
+## 1. 新增 `player_stats_mode`
+
+新增參數：
+
+```bash
+--player_stats_mode none/basic
+```
+
+設定說明：
+
+```text
+none:
+    不使用 player historical stats，維持原本行為。
+
+basic:
+    加入目前球員與對手的歷史統計特徵。
+```
+
+---
+
+## 2. Player Historical Stats Basic 特徵
+
+`player_stats_mode=basic` 會新增以下特徵：
+
+```text
+currentPlayerActionTop1
+currentPlayerPointTop1
+currentPlayerServerWinRateBin
+currentPlayerCountBin
+
+otherPlayerActionTop1
+otherPlayerPointTop1
+otherPlayerServerWinRateBin
+otherPlayerCountBin
+```
+
+---
+
+## 3. 特徵意義
+
+### currentPlayerActionTop1
+
+該 `gamePlayerId` 在統計資料中最常出現的 `actionId`。
+
+---
+
+### currentPlayerPointTop1
+
+該 `gamePlayerId` 在統計資料中最常出現的 `pointId`。
+
+---
+
+### currentPlayerServerWinRateBin
+
+該 player 作為發球方時的 `serverGetPoint` 平均值分箱。
+
+分箱方式：
+
+```text
+0.0 <= rate < 0.2  -> 0
+0.2 <= rate < 0.4  -> 1
+0.4 <= rate < 0.6  -> 2
+0.6 <= rate < 0.8  -> 3
+0.8 <= rate <= 1.0 -> 4
+```
+
+---
+
+### currentPlayerCountBin
+
+該 player 在統計資料中出現次數分箱。
+
+分箱方式：
+
+```text
+count <= 1        -> 0
+2 <= count <= 5   -> 1
+6 <= count <= 20  -> 2
+21 <= count <= 50 -> 3
+51 <= count <= 100 -> 4
+count > 100       -> 5
+```
+
+---
+
+### otherPlayer 對應欄位
+
+`otherPlayerActionTop1`、`otherPlayerPointTop1`、`otherPlayerServerWinRateBin`、`otherPlayerCountBin` 使用同樣邏輯，但以 `gamePlayerOtherId` 作為查詢對象。
+
+---
+
+## 4. 避免資料洩漏
+
+Player historical stats 需要特別避免 validation leakage。
+
+本次實作規則：
+
+```text
+一般 train / validation：
+    只使用 train split 計算 player stats。
+    validation split 只能查 train split 統計結果。
+
+K-Fold：
+    每個 fold 只使用該 fold 的 train 部分計算 player stats。
+    validation fold 不會參與統計。
+
+refit_full：
+    正式訓練階段使用完整 train.csv 計算 player stats。
+    再套用到完整 train.csv 與 test_new.csv。
+```
+
+這樣可以避免 validation 或 test 的 label 資訊被提前洩漏。
+
+---
+
+## 5. K-Fold 結果
+
+固定主線設定：
+
+```text
+player_feature_mode = both
+role_feature_mode = basic
+class_weight_method = power
+action_weight_power = 0.5
+point_weight_power = 0.70
+action_w = 0.45
+point_w = 0.45
+rally_w = 0.10
+```
+
+K-Fold 對照結果：
+
+| player_stats_mode | Final mean | Final std | F1_action mean | F1_action_last mean | F1_point mean | AUC mean |
+|---|---:|---:|---:|---:|---:|---:|
+| none | 0.4822 | 0.0069 | 0.4575 | 0.4137 | 0.2494 | 0.9972 |
+| basic | 0.4845 | 0.0072 | 0.4602 | 0.4169 | 0.2527 | 0.9967 |
+
+結果顯示：
+
+```text
+player_stats_mode=basic 在 K-Fold 上小幅提升 Final、F1_action、F1_action_last 與 F1_point。
+```
+
+---
+
+## 6. 平台結果
+
+使用 `player_stats_mode=basic` 並手動設定：
+
+```text
+refit_epochs = 10
+```
+
+平台分數達到：
+
+```text
+0.3459151
+```
+
+相較前一版主力：
+
+```text
+submission_action_player_both_role_basic_refit_ep9.csv
+平台分數：0.333511
+```
+
+本次提升明顯，因此目前正式主力更新為：
+
+```text
+submission_action_player_stats_basic_refit_ep10.csv
+```
+
+---
+
+## 7. 目前最佳 submission 產生指令
 
 ```bash
 python baseline_action_without_slice.py \
@@ -2162,6 +2322,7 @@ python baseline_action_without_slice.py \
   --select_metric final \
   --player_feature_mode both \
   --role_feature_mode basic \
+  --player_stats_mode basic \
   --class_weight_method power \
   --action_weight_power 0.5 \
   --point_weight_power 0.70 \
@@ -2170,10 +2331,55 @@ python baseline_action_without_slice.py \
   --point_w 0.45 \
   --rally_w 0.10 \
   --refit_full \
-  --refit_epochs 9 \
-  --out submission_action_player_both_role_basic_refit_ep9.csv \
-  --save_prob_file probs_action_player_both_role_basic_refit_ep9.npz
+  --refit_epochs 10 \
+  --out submission_action_player_stats_basic_refit_ep10.csv \
+  --save_prob_file probs_action_player_stats_basic_refit_ep10.npz
 ```
 
 ---
+
+## 8. 目前版本排序
+
+```text
+第 1 名：
+submission_action_player_stats_basic_refit_ep10.csv
+平台分數：0.3459151
+
+第 2 名：
+submission_action_player_both_role_basic_refit_ep9.csv
+平台分數：0.333511
+
+第 3 名：
+submission_action_player_both_refit.csv
+平台分數：0.3261155
+```
+
+---
+
+## 9. 目前正式主力
+
+目前最佳主線已從：
+
+```text
+player features + role features
+```
+
+升級為：
+
+```text
+player features + role features + player historical stats
+```
+
+目前正式主力設定：
+
+```text
+player_feature_mode = both
+role_feature_mode = basic
+player_stats_mode = basic
+refit_epochs = 10
+```
+
+---
+
+
 

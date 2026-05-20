@@ -1810,21 +1810,145 @@ hidden=240, emb=22 不取代主力模型，
 ```
 
 ---
+# 2026-05-21 更新紀錄：Soft Ensemble 欄位權重調整與 Player / Role Feature 實驗
 
-# 目前正式主力指令
+本次更新主要記錄從 soft ensemble 欄位權重調整，到加入球員特徵與角色特徵後的實驗結果。
 
-## 目前最高版本：Soft Ensemble 75/25
+目前最新平台最佳版本為：
 
-```bash
-python soft_ensemble_probs.py \
-  --prob_files probs_action_pwp070_refit_full.npz,probs_action_h240_e22_pwp070_refit.npz \
-  --weights 0.75,0.25 \
-  --out submission_soft_ensemble_7525.csv
+```text
+submission_action_player_both_role_basic_refit_ep9.csv
+```
+
+平台分數：
+
+```text
+0.333511
 ```
 
 ---
 
-## 最佳單一模型
+# 1. Soft Ensemble 欄位權重調整
+
+先前已實作 probability output 與 soft ensemble：
+
+```text
+--save_prob_file
+soft_ensemble_probs.py
+```
+
+soft ensemble 會讀取多個 `.npz` probability files，平均：
+
+```text
+action_probs
+point_probs
+server_probs
+```
+
+再輸出 submission。
+
+---
+
+## 1.1 原始 soft ensemble 結果
+
+最初使用同一組權重套用到三個欄位：
+
+```text
+action / point / server = 75 / 25
+```
+
+平台結果顯示：
+
+```text
+submission_soft_ensemble_7525.csv
+```
+
+高於當時的單一主力模型。
+
+---
+
+## 1.2 分欄位權重測試
+
+後續將 soft ensemble 改成可分別設定：
+
+```text
+action_weights
+point_weights
+server_weights
+```
+
+測試結果如下：
+
+| 設定 | 說明 | 平台分數 | 結論 |
+|---|---|---:|---|
+| A65 / P75 / S75 | 提高候選模型在 action 欄位的權重 | 0.3191844 | 較差 |
+| A75 / P65 / S75 | 提高候選模型在 point 欄位的權重 | 0.3198545 | 當時新高 |
+| A75 / P75 / S65 | 提高候選模型在 server 欄位的權重 | 0.3197635 | 有提升，但低於 A75/P65/S75 |
+
+結論：
+
+```text
+候選模型 h240_e22 單獨不如主力模型，
+但它的 probability output 對 pointId 與 serverGetPoint 有互補效果。
+```
+
+其中：
+
+```text
+A75 / P65 / S75
+```
+
+是 soft ensemble 階段的最佳組合。
+
+---
+
+# 2. Player ID Embedding 實驗
+
+資料欄位中包含：
+
+```text
+gamePlayerId
+gamePlayerOtherId
+```
+
+因此新增：
+
+```bash
+--player_feature_mode none/current/opponent/both
+```
+
+設定說明：
+
+```text
+none      不使用 playerId
+current   使用 gamePlayerId
+opponent  使用 gamePlayerOtherId
+both      同時使用 gamePlayerId 和 gamePlayerOtherId
+```
+
+---
+
+## 2.1 K-Fold 結果
+
+| player_feature_mode | Final mean | F1_action mean | F1_action_last mean | F1_point mean | 結論 |
+|---|---:|---:|---:|---:|---|
+| none | 0.4435 | 0.3883 | 0.3481 | 0.2215 | 原本主線 |
+| current | 0.4676 | 0.4336 | 0.3862 | 0.2365 | 明顯提升 |
+| opponent | 0.4770 | 0.4524 | 0.4140 | 0.2410 | 很強 |
+| both | 0.4790 | 0.4525 | 0.4181 | 0.2463 | K-Fold 最佳 |
+
+結論：
+
+```text
+加入 playerId 特徵明顯有效。
+gamePlayerId 與 gamePlayerOtherId 同時使用時效果最佳。
+```
+
+---
+
+## 2.2 平台結果
+
+產生 `player_feature_mode=both` 的 refit 版本：
 
 ```bash
 python baseline_action_without_slice.py \
@@ -1832,6 +1956,7 @@ python baseline_action_without_slice.py \
   --split_seed 42 \
   --epochs 10 \
   --select_metric final \
+  --player_feature_mode both \
   --class_weight_method power \
   --action_weight_power 0.5 \
   --point_weight_power 0.70 \
@@ -1840,7 +1965,214 @@ python baseline_action_without_slice.py \
   --point_w 0.45 \
   --rally_w 0.10 \
   --refit_full \
-  --out submission_action_pwp070_refit_full.csv
+  --out submission_action_player_both_refit.csv
+```
+
+平台分數：
+
+```text
+0.3261155
+```
+
+此版本當時成為新高。
+
+---
+
+# 3. Role Feature 實驗
+
+在 player feature 有效後，進一步新增角色化特徵：
+
+```bash
+--role_feature_mode none/basic/full
+```
+
+設定說明：
+
+```text
+none
+    不使用角色特徵。
+
+basic
+    使用：
+    - serverPlayerId
+    - receiverPlayerId
+    - isCurrentPlayerServer
+
+full
+    在 basic 基礎上額外加入：
+    - serverScore
+    - receiverScore
+    - serverScoreDiff
+    - serverIsLeading
+    - serverIsTie
+```
+
+---
+
+## 3.1 K-Fold 結果
+
+固定：
+
+```text
+player_feature_mode = both
+```
+
+測試 role feature：
+
+| role_feature_mode | Final mean | F1_action mean | F1_action_last mean | F1_point mean | 結論 |
+|---|---:|---:|---:|---:|---|
+| none | 0.4790 | 0.4525 | 0.4181 | 0.2463 | player_both 原本版本 |
+| basic | 0.4832 | 0.4604 | 0.4120 | 0.2491 | K-Fold 最佳 |
+| full | 0.4775 | 0.4535 | 0.4125 | 0.2417 | 不採用 |
+
+結論：
+
+```text
+basic role features 有效。
+full role features 反而較差。
+```
+
+可能原因：
+
+```text
+full 模式中的 serverScore / receiverScore / serverScoreDiff 等特徵
+與原本已有的 scoreSelf / scoreOther 資訊重複，
+可能增加雜訊。
+```
+
+---
+
+## 3.2 Auto refit 結果
+
+`role_feature_mode=basic` 使用自動 refit 時，單次 validation 選到：
+
+```text
+best_epoch = 6
+```
+
+平台分數：
+
+```text
+0.3245760
+```
+
+低於 `player_feature_mode=both` 的版本。
+
+---
+
+## 3.3 手動 refit_epochs=9 結果
+
+K-Fold 中 `role_feature_mode=basic` 的 best epoch 分布大約落在：
+
+```text
+4, 10, 7, 11, 9
+```
+
+因此使用中位數附近的 epoch 9 做手動 refit：
+
+```bash
+python baseline_action_without_slice.py \
+  --seed 42 \
+  --split_seed 42 \
+  --epochs 12 \
+  --select_metric final \
+  --player_feature_mode both \
+  --role_feature_mode basic \
+  --class_weight_method power \
+  --action_weight_power 0.5 \
+  --point_weight_power 0.70 \
+  --class_weight_max 0 \
+  --action_w 0.45 \
+  --point_w 0.45 \
+  --rally_w 0.10 \
+  --refit_full \
+  --refit_epochs 9 \
+  --out submission_action_player_both_role_basic_refit_ep9.csv \
+  --save_prob_file probs_action_player_both_role_basic_refit_ep9.npz
+```
+
+平台分數：
+
+```text
+0.333511
+```
+
+此版本成為目前平台最高版本。
+
+---
+
+# 4. 目前最佳版本
+
+目前最佳 submission：
+
+```text
+submission_action_player_both_role_basic_refit_ep9.csv
+```
+
+目前最佳設定：
+
+```text
+V1.6 Action Transition Head
++ player_feature_mode = both
++ role_feature_mode = basic
++ class_weight_method = power
++ action_weight_power = 0.5
++ point_weight_power = 0.70
++ class_weight_max = 0
++ action_w = 0.45
++ point_w = 0.45
++ rally_w = 0.10
++ refit_full
++ refit_epochs = 9
+```
+
+---
+
+# 5. 目前不採用的相關設定
+
+## 5.1 Soft ensemble 欄位權重
+
+雖然 soft ensemble 曾提升分數，但目前已被 player + role feature 版本超越。
+
+目前保留功能，但不作為最新主力。
+
+---
+
+## 5.2 role_feature_mode=full
+
+`full` 已測試，但 K-Fold 結果低於 `basic`。
+
+目前不採用：
+
+```text
+role_feature_mode = full
+```
+
+但功能保留作為實驗參數。
+
+---
+
+# 6. 目前正式主力指令
+
+```bash
+python baseline_action_without_slice.py \
+  --seed 42 \
+  --split_seed 42 \
+  --epochs 12 \
+  --select_metric final \
+  --player_feature_mode both \
+  --role_feature_mode basic \
+  --class_weight_method power \
+  --action_weight_power 0.5 \
+  --point_weight_power 0.70 \
+  --class_weight_max 0 \
+  --action_w 0.45 \
+  --point_w 0.45 \
+  --rally_w 0.10 \
+  --refit_full \
+  --refit_epochs 9 \
+  --out submission_action_player_both_role_basic_refit_ep9.csv \
+  --save_prob_file probs_action_player_both_role_basic_refit_ep9.npz
 ```
 
 ---

@@ -2381,5 +2381,195 @@ refit_epochs = 10
 
 ---
 
+## 2026-05-21 T3 (serverGetPoint AUC) — 短序列對齊、5-seed 平均、window_k、Early Stopping、Holdout 驗證、訓練曲線監控
 
+本次更新主要針對 `baseline_auc_sliced.py`，加強 T3 模型的訓練穩健性、短序列泛化能力與驗證可靠性。
 
+---
+
+### 目前最佳 T3 LB 成績
+
+| 模型 | val AUC | LB AUC | 備註 |
+|---|---|---|---|
+| P8 5-seed ensemble | 0.5593（avg） | 0.5757 | 主力單模型 |
+| P17 player_strict 5-seed | 0.6000（avg） | 0.5720 | val 高估 LB，OOD 實驗用 |
+| P8+P17 rank-blend 70/30 | — | 0.5775 | — |
+| P15d window_k=3 5-seed | 0.5772（avg） | 0.5819 | — |
+| **P15d window_k=2 5-seed** | **0.5767（avg）** | **0.5934** | **★ 目前最佳** |
+
+---
+
+### 1. 5-seed 平均（必要實驗規範）
+
+**問題**：P8 單 seed val AUC range 達 0.0247（0.5462 ~ 0.5709），單一 seed 結果完全不可信。
+
+**做法**：所有實驗改用 5 個 seed 取平均，以 `--seed` 分別執行 seed 42/123/456/789/2024，再對預測機率取 mean 後輸出。
+
+| seed | 42 | 123 | 456 | 789 | 2024 | 平均 |
+|---|---|---|---|---|---|---|
+| val AUC | 0.5709 | 0.5689 | 0.5462 | 0.5701 | 0.5403 | **0.5593** |
+
+**原則：所有後續 T3 實驗均需 5-seed，不得以單 seed 結果作決策。**
+
+---
+
+### 2. window_k 短序列訓練（P15d）
+
+**新增參數**：`--window_k k`（預設 0 = 停用，保留原始全序列行為）
+
+**問題**：test_new 中位數序列長度僅 2 拍（54% ≤ 2 拍），但訓練 prefix 從第 1 拍切時仍包含大量長 prefix，造成分布偏移。
+
+**機制**：啟用後，每個 prefix 只取最後 k 拍作為模型輸入（滑動窗口），同時 test inference 也套用相同的窗口截斷。
+
+```python
+# 訓練：每個 prefix 只取最後 k 拍
+for cut_end in range(1, len(g)):
+    if wk > 0:
+        start = max(0, cut_end - wk)   # 只看最後 k 拍
+    else:
+        start = 0
+
+# Inference：test 也套用相同窗口
+if wk > 0 and len(Xg) > wk:
+    Xg = Xg[-wk:]
+```
+
+**推薦設定**：`--window_k 3`（對齊 test 中位數 2 拍；72% 的 test ≤ 4 拍）
+
+**效果**：去掉早期雜訊 prefix，讓模型更難在長 prefix 上過擬合，理論上可延後 best epoch（目前 best epoch=1 的過擬合問題）。
+
+---
+
+### 3. Early Stopping
+
+**新增參數**：`--patience N`（N=0 表示停用，預設 0）
+
+**機制**：連續 N 個 epoch 在 `--select_metric` 指定的指標上沒有進步，則提前停止。
+
+```python
+if args.patience > 0 and bad_epochs >= args.patience:
+    print(f"Early stopping at epoch {ep}. Best epoch={best_epoch}")
+    break
+```
+
+**實測問題背景**：P8/P17/P9b 系列的 best epoch 全部落在 epoch 1，代表模型幾乎沒學就開始過擬合。`--patience 1` 可在 best epoch=1 時立即停下，節省 9 個無效 epoch。
+
+**建議用法**：
+
+```bash
+# 快速掃描實驗（best epoch 已知落在 epoch 1~3）
+python baseline_auc_sliced.py --patience 2 --epochs 5 ...
+```
+
+---
+
+### 4. Holdout 驗證 — 三種 CV 模式（P17）
+
+**新增參數**：`--cv_mode {rally,player,player_strict}`、`--val_player_frac`
+
+| CV 模式 | 說明 | val AUC（5-seed avg）| LB AUC |
+|---|---|---|---|
+| `rally`（預設）| 以 rally_uid stratified split，樂觀估計 | 0.5593 | **0.5757** |
+| `player` | 以 gamePlayerId GroupShuffleSplit，val 球員不在 train 當主視角 | — | — |
+| `player_strict` | 嚴格 OOD：val = 任一方球員 ∈ val_players（模擬 test 44% OOD 球員）| 0.6000 | 0.5720 |
+
+**關鍵教訓**：**val AUC 跨 CV 模式不可類推。**
+
+- `rally` CV：val 低估 LB 0.016（val 0.5593 → LB 0.5757）
+- `player_strict` CV：val 高估 LB 0.028（val 0.6000 → LB 0.5720）
+- 只能在**同一 CV 模式內**，比較不同 hyperparam 的相對優劣。
+
+`--val_player_frac 0.25` 讓 val rally 佔比 ~41%，接近 test 真實 44% OOD 球員比例。
+
+---
+
+### 5. 訓練曲線監控
+
+每個 epoch 輸出以下完整指標，供人工判斷是否過擬合：
+
+```
+[Epoch X/N] train_loss=1.51 val_loss=1.56
+  F1_action=0.XXXX  F1_action_last=0.XXXX  F1_point=0.XXXX
+  AUC=0.XXXX  AUC_blend=0.XXXX
+  AUC_short=0.XXXX(n=XXX)  AUC_long=0.XXXX(n=XXX)
+  Final~=0.XXXX
+```
+
+| 指標 | 說明 |
+|---|---|
+| `AUC_blend` | 短序列（< `blend_max_len` 拍）混合球員歷史勝率後的 AUC |
+| `AUC_short` | 序列長度 ≤ 2 的 rally 子集 AUC |
+| `AUC_long` | 序列長度 ≥ 3 的 rally 子集 AUC |
+
+**目前過擬合證據**（P8/P17/P9b）：
+
+```
+Epoch 1:  train_loss=1.51  val_loss=1.56  val_AUC=0.569  ← best
+Epoch 2:  train_loss=1.20  val_loss=1.63  val_AUC=0.564
+Epoch 5:  train_loss=0.80  val_loss=1.98  val_AUC=0.533
+```
+
+---
+
+### 6. P9e refit_full（新增至 T3 主流程）
+
+`--refit_full` 找到 best epoch 後，用全部資料（train+val）重新從頭訓練 best_epoch 輪，再進行 inference。
+
+```bash
+python baseline_auc_sliced.py \
+  --seed 42 --epochs 10 --select_metric auc \
+  --refit_full \
+  --out submission_p8_refit_full.csv
+```
+
+---
+
+### 7. Rank-blend Ensemble 策略
+
+**原則**：多樣性 > 強度。P17 LB 比 P8 弱 0.004，但 Pearson corr=0.87，rank-blend 後反而贏 P8 0.0018。
+
+```python
+from scipy.stats import rankdata
+r8  = rankdata(p8["serverGetPoint"].values)
+r17 = rankdata(p17["serverGetPoint"].values)
+blend = 0.7 * r8 + 0.3 * r17
+blend_n = (blend - blend.min()) / (blend.max() - blend.min())
+```
+
+| 組合 | LB AUC |
+|---|---|
+| P8 alone | 0.5757 |
+| P17 alone | 0.5720 |
+| **P8+P17 rank-blend 70/30** | **0.5775 ✅** |
+
+---
+
+### 8. 目前 T3 主力指令（5-seed 版）
+
+```bash
+for SEED in 42 123 456 789 2024; do
+  python baseline_auc_sliced.py \
+    --seed $SEED --epochs 10 --select_metric auc \
+    --window_k 2 \
+    --blend_alpha 0.5 --blend_max_len 4 \
+    --cv_mode rally --val_size 0.10 \
+    --out submission_p15d_wk2_s${SEED}.csv
+done
+# 再對 5 個 submission 取平均機率後輸出最終 submission
+# 當前最佳：LB AUC 0.5934（submission_p15d_wk2_ens5.csv）
+```
+
+---
+
+### 已驗證無效（T3）
+
+| 方向 | 原因 |
+|---|---|
+| Dropout 0.3（P9a）| +0.0008（noise），corr vs P8 > 0.99 |
+| weight_decay 1e-4（P9b）| corr vs P8 = 0.9907，ensemble 加入 = 沒加 |
+| 球員 ID Embedding | 44% OOD 球員過擬合，val_loss 持續上升 |
+| Transformer | 14k 樣本太小，test 中位數 2 拍無長期可學 |
+| Attention pooling | init=0 早期不穩 |
+| P17 player_strict 單獨主提交 | LB 0.5720 < P8 0.5757 |
+
+---

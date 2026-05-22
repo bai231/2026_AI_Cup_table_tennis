@@ -21,7 +21,130 @@ BASE_FEATURES = [
 PAD_TOKEN = 0
 
 
-def get_features(player_feature_mode, role_feature_mode, player_stats_mode):
+def get_basic_player_stats_features(subset):
+    all_features = [
+        "currentPlayerActionTop1",
+        "currentPlayerPointTop1",
+        "currentPlayerServerWinRateBin",
+        "currentPlayerCountBin",
+        "otherPlayerActionTop1",
+        "otherPlayerPointTop1",
+        "otherPlayerServerWinRateBin",
+        "otherPlayerCountBin",
+    ]
+
+    if subset == "all":
+        return all_features
+
+    if subset == "top1":
+        return [
+            "currentPlayerActionTop1",
+            "currentPlayerPointTop1",
+            "otherPlayerActionTop1",
+            "otherPlayerPointTop1",
+        ]
+
+    if subset == "rate":
+        return [
+            "currentPlayerServerWinRateBin",
+            "otherPlayerServerWinRateBin",
+        ]
+
+    if subset == "count":
+        return [
+            "currentPlayerCountBin",
+            "otherPlayerCountBin",
+        ]
+
+    if subset == "current_only":
+        return [
+            "currentPlayerActionTop1",
+            "currentPlayerPointTop1",
+            "currentPlayerServerWinRateBin",
+            "currentPlayerCountBin",
+        ]
+
+    if subset == "other_only":
+        return [
+            "otherPlayerActionTop1",
+            "otherPlayerPointTop1",
+            "otherPlayerServerWinRateBin",
+            "otherPlayerCountBin",
+        ]
+
+    if subset == "no_count":
+        return [
+            "currentPlayerActionTop1",
+            "currentPlayerPointTop1",
+            "currentPlayerServerWinRateBin",
+            "otherPlayerActionTop1",
+            "otherPlayerPointTop1",
+            "otherPlayerServerWinRateBin",
+        ]
+
+    if subset == "no_rate":
+        return [
+            "currentPlayerActionTop1",
+            "currentPlayerPointTop1",
+            "currentPlayerCountBin",
+            "otherPlayerActionTop1",
+            "otherPlayerPointTop1",
+            "otherPlayerCountBin",
+        ]
+
+    raise ValueError(f"Unsupported player_stats_subset: {subset}")
+
+
+def get_interaction_features(interaction_feature_mode):
+    if interaction_feature_mode == "none":
+        return []
+
+    if interaction_feature_mode == "action_strength":
+        return ["actionStrengthId"]
+
+    if interaction_feature_mode == "action_position":
+        return ["actionPositionId"]
+
+    if interaction_feature_mode == "action_spin":
+        return ["actionSpinId"]
+
+    if interaction_feature_mode == "strength_position":
+        return ["strengthPositionId"]
+
+    if interaction_feature_mode == "spin_position":
+        return ["spinPositionId"]
+
+    if interaction_feature_mode == "strike_action":
+        return ["strikeActionId"]
+
+    if interaction_feature_mode == "basic":
+        return [
+            "actionStrengthId",
+            "actionPositionId",
+            "actionSpinId",
+        ]
+
+    if interaction_feature_mode == "full":
+        return [
+            "actionStrengthId",
+            "actionPositionId",
+            "actionSpinId",
+            "strengthPositionId",
+            "spinPositionId",
+            "strikeActionId",
+        ]
+
+    raise ValueError(f"Unsupported interaction_feature_mode: {interaction_feature_mode}")
+
+
+def get_features(
+    player_feature_mode,
+    role_feature_mode,
+    player_stats_mode,
+    pair_feature_mode,
+    player_stats_subset,
+    interaction_feature_mode,
+):
     features = list(BASE_FEATURES)
 
     if player_feature_mode in ["current", "both"]:
@@ -47,16 +170,42 @@ def get_features(player_feature_mode, role_feature_mode, player_stats_mode):
         ])
 
     if player_stats_mode == "basic":
+        features.extend(get_basic_player_stats_features(player_stats_subset))
+    elif player_stats_mode == "extended":
+        features.extend(get_basic_player_stats_features("all"))
         features.extend([
-            "currentPlayerActionTop1",
-            "currentPlayerPointTop1",
-            "currentPlayerServerWinRateBin",
-            "currentPlayerCountBin",
-            "otherPlayerActionTop1",
-            "otherPlayerPointTop1",
-            "otherPlayerServerWinRateBin",
-            "otherPlayerCountBin",
+            "currentPlayerActionTop2",
+            "currentPlayerActionTop3",
+            "currentPlayerPointTop2",
+            "currentPlayerPointTop3",
+            "currentPlayerActionDiversityBin",
+            "currentPlayerPointDiversityBin",
+            "otherPlayerActionTop2",
+            "otherPlayerActionTop3",
+            "otherPlayerPointTop2",
+            "otherPlayerPointTop3",
+            "otherPlayerActionDiversityBin",
+            "otherPlayerPointDiversityBin",
         ])
+    elif player_stats_mode == "role":
+        features.extend([
+            "serverPlayerActionTop1",
+            "serverPlayerPointTop1",
+            "serverPlayerServerWinRateBin",
+            "serverPlayerCountBin",
+            "receiverPlayerActionTop1",
+            "receiverPlayerPointTop1",
+            "receiverPlayerReceiveWinRateBin",
+            "receiverPlayerCountBin",
+        ])
+
+    if pair_feature_mode in ["current", "both"]:
+        features.append("currentPlayerPairId")
+
+    if pair_feature_mode in ["server", "both"]:
+        features.append("serverReceiverPairId")
+
+    features.extend(get_interaction_features(interaction_feature_mode))
 
     return features
 
@@ -377,25 +526,68 @@ def _mode_top1(series):
     return counts.idxmax()
 
 
-def build_player_stats(source_df):
+def top_k_values(values, k=3, fallback=None):
+    counts = pd.Series(values).value_counts()
+
+    if len(counts) == 0:
+        return [fallback] * k
+
+    tops = counts.index.tolist()
+
+    while len(tops) < k:
+        tops.append(tops[-1])
+
+    return tops[:k]
+
+
+def bin_diversity_from_values(values):
+    counts = pd.Series(values).value_counts().to_numpy(dtype=np.float64)
+
+    if len(counts) <= 1:
+        return 0
+
+    probs = counts / counts.sum()
+    entropy = -(probs * np.log(probs + 1e-12)).sum()
+    normalized = entropy / np.log(len(counts))
+
+    return bin_rate(normalized)
+
+
+def build_player_stats(source_df, min_count=0):
     source_df = source_df.copy()
 
     player_counts = source_df["gamePlayerId"].value_counts()
-    action_top1 = (
+    action_top_lists = (
         source_df.groupby("gamePlayerId")["actionId"]
-        .agg(_mode_top1)
-        .dropna()
+        .apply(lambda s: top_k_values(s.tolist(), k=3))
         .to_dict()
     )
-    point_top1 = (
+    point_top_lists = (
         source_df.groupby("gamePlayerId")["pointId"]
-        .agg(_mode_top1)
-        .dropna()
+        .apply(lambda s: top_k_values(s.tolist(), k=3))
+        .to_dict()
+    )
+    action_diversity_bin = (
+        source_df.groupby("gamePlayerId")["actionId"]
+        .apply(lambda s: bin_diversity_from_values(s.tolist()))
+        .to_dict()
+    )
+    point_diversity_bin = (
+        source_df.groupby("gamePlayerId")["pointId"]
+        .apply(lambda s: bin_diversity_from_values(s.tolist()))
         .to_dict()
     )
 
-    global_action_top1 = _mode_top1(source_df["actionId"])
-    global_point_top1 = _mode_top1(source_df["pointId"])
+    global_action_tops = top_k_values(source_df["actionId"].tolist(), k=3)
+    global_point_tops = top_k_values(source_df["pointId"].tolist(), k=3)
+    global_action_top1 = int(global_action_tops[0])
+    global_action_top2 = int(global_action_tops[1])
+    global_action_top3 = int(global_action_tops[2])
+    global_point_top1 = int(global_point_tops[0])
+    global_point_top2 = int(global_point_tops[1])
+    global_point_top3 = int(global_point_tops[2])
+    global_action_diversity_bin = int(bin_diversity_from_values(source_df["actionId"].tolist()))
+    global_point_diversity_bin = int(bin_diversity_from_values(source_df["pointId"].tolist()))
 
     rally_server = (
         source_df.sort_values(["rally_uid", "strikeNumber"])
@@ -405,21 +597,57 @@ def build_player_stats(source_df):
     )
 
     server_win_rate = rally_server.groupby("serverPlayerId")["serverGetPoint"].mean()
+    server_counts = rally_server["serverPlayerId"].value_counts()
     global_server_win_rate = float(rally_server["serverGetPoint"].mean())
+
+    valid_player_ids = set(player_counts.index)
+    valid_server_ids = set(server_counts.index)
+
+    if min_count > 0:
+        valid_player_ids = set(player_counts[player_counts >= min_count].index)
+        valid_server_ids = set(server_counts[server_counts >= min_count].index)
+
+    action_top1 = {k: int(v[0]) for k, v in action_top_lists.items() if k in valid_player_ids}
+    action_top2 = {k: int(v[1]) for k, v in action_top_lists.items() if k in valid_player_ids}
+    action_top3 = {k: int(v[2]) for k, v in action_top_lists.items() if k in valid_player_ids}
+    point_top1 = {k: int(v[0]) for k, v in point_top_lists.items() if k in valid_player_ids}
+    point_top2 = {k: int(v[1]) for k, v in point_top_lists.items() if k in valid_player_ids}
+    point_top3 = {k: int(v[2]) for k, v in point_top_lists.items() if k in valid_player_ids}
+    count_bin = {k: bin_count(v) for k, v in player_counts.to_dict().items() if k in valid_player_ids}
+    server_win_rate_bin = {
+        k: bin_rate(v)
+        for k, v in server_win_rate.to_dict().items()
+        if k in valid_server_ids
+    }
+    action_diversity_bin = {k: v for k, v in action_diversity_bin.items() if k in valid_player_ids}
+    point_diversity_bin = {k: v for k, v in point_diversity_bin.items() if k in valid_player_ids}
 
     return {
         "action_top1": action_top1,
+        "action_top2": action_top2,
+        "action_top3": action_top3,
         "point_top1": point_top1,
-        "server_win_rate_bin": {k: bin_rate(v) for k, v in server_win_rate.to_dict().items()},
-        "count_bin": {k: bin_count(v) for k, v in player_counts.to_dict().items()},
-        "global_action_top1": int(global_action_top1),
-        "global_point_top1": int(global_point_top1),
+        "point_top2": point_top2,
+        "point_top3": point_top3,
+        "server_win_rate_bin": server_win_rate_bin,
+        "count_bin": count_bin,
+        "action_diversity_bin": action_diversity_bin,
+        "point_diversity_bin": point_diversity_bin,
+        "global_action_top1": global_action_top1,
+        "global_action_top2": global_action_top2,
+        "global_action_top3": global_action_top3,
+        "global_point_top1": global_point_top1,
+        "global_point_top2": global_point_top2,
+        "global_point_top3": global_point_top3,
+        "global_action_diversity_bin": global_action_diversity_bin,
+        "global_point_diversity_bin": global_point_diversity_bin,
         "global_server_win_rate_bin": int(bin_rate(global_server_win_rate)),
         "global_count_bin": 0,
+        "min_count": int(min_count),
     }
 
 
-def apply_player_stats_features(df, stats):
+def apply_player_stats_features(df, stats, mode="basic"):
     df = df.copy()
 
     current_player = df["gamePlayerId"]
@@ -434,6 +662,205 @@ def apply_player_stats_features(df, stats):
     df["otherPlayerPointTop1"] = other_player.map(stats["point_top1"]).fillna(stats["global_point_top1"]).astype(np.int64)
     df["otherPlayerServerWinRateBin"] = other_player.map(stats["server_win_rate_bin"]).fillna(stats["global_server_win_rate_bin"]).astype(np.int64)
     df["otherPlayerCountBin"] = other_player.map(stats["count_bin"]).fillna(0).astype(np.int64)
+
+    if mode == "extended":
+        df["currentPlayerActionTop2"] = current_player.map(stats["action_top2"]).fillna(stats["global_action_top2"]).astype(np.int64)
+        df["currentPlayerActionTop3"] = current_player.map(stats["action_top3"]).fillna(stats["global_action_top3"]).astype(np.int64)
+        df["currentPlayerPointTop2"] = current_player.map(stats["point_top2"]).fillna(stats["global_point_top2"]).astype(np.int64)
+        df["currentPlayerPointTop3"] = current_player.map(stats["point_top3"]).fillna(stats["global_point_top3"]).astype(np.int64)
+        df["currentPlayerActionDiversityBin"] = current_player.map(stats["action_diversity_bin"]).fillna(stats["global_action_diversity_bin"]).astype(np.int64)
+        df["currentPlayerPointDiversityBin"] = current_player.map(stats["point_diversity_bin"]).fillna(stats["global_point_diversity_bin"]).astype(np.int64)
+
+        df["otherPlayerActionTop2"] = other_player.map(stats["action_top2"]).fillna(stats["global_action_top2"]).astype(np.int64)
+        df["otherPlayerActionTop3"] = other_player.map(stats["action_top3"]).fillna(stats["global_action_top3"]).astype(np.int64)
+        df["otherPlayerPointTop2"] = other_player.map(stats["point_top2"]).fillna(stats["global_point_top2"]).astype(np.int64)
+        df["otherPlayerPointTop3"] = other_player.map(stats["point_top3"]).fillna(stats["global_point_top3"]).astype(np.int64)
+        df["otherPlayerActionDiversityBin"] = other_player.map(stats["action_diversity_bin"]).fillna(stats["global_action_diversity_bin"]).astype(np.int64)
+        df["otherPlayerPointDiversityBin"] = other_player.map(stats["point_diversity_bin"]).fillna(stats["global_point_diversity_bin"]).astype(np.int64)
+
+    return df
+
+
+def add_pair_features(df, pair_feature_mode):
+    df = df.copy()
+
+    if pair_feature_mode in ["current", "both"]:
+        df["currentPlayerPairId"] = (
+            df["gamePlayerId"].astype(str)
+            + "_"
+            + df["gamePlayerOtherId"].astype(str)
+        )
+
+    if pair_feature_mode in ["server", "both"]:
+        if "serverPlayerId" not in df.columns or "receiverPlayerId" not in df.columns:
+            raise ValueError(
+                "serverReceiverPairId requires serverPlayerId and receiverPlayerId. "
+                "Call add_role_features before add_pair_features."
+            )
+
+        df["serverReceiverPairId"] = (
+            df["serverPlayerId"].astype(str)
+            + "_"
+            + df["receiverPlayerId"].astype(str)
+        )
+
+    return df
+
+
+def add_interaction_features(df, interaction_feature_mode):
+    df = df.copy()
+
+    need_action_strength = interaction_feature_mode in [
+        "action_strength", "basic", "full"
+    ]
+    need_action_position = interaction_feature_mode in [
+        "action_position", "basic", "full"
+    ]
+    need_action_spin = interaction_feature_mode in [
+        "action_spin", "basic", "full"
+    ]
+    need_strength_position = interaction_feature_mode in [
+        "strength_position", "full"
+    ]
+    need_spin_position = interaction_feature_mode in [
+        "spin_position", "full"
+    ]
+    need_strike_action = interaction_feature_mode in [
+        "strike_action", "full"
+    ]
+
+    if need_action_strength:
+        df["actionStrengthId"] = (
+            df["actionId"].astype(str) + "_" + df["strengthId"].astype(str)
+        )
+    if need_action_position:
+        df["actionPositionId"] = (
+            df["actionId"].astype(str) + "_" + df["positionId"].astype(str)
+        )
+    if need_action_spin:
+        df["actionSpinId"] = (
+            df["actionId"].astype(str) + "_" + df["spinId"].astype(str)
+        )
+
+    if need_strength_position:
+        df["strengthPositionId"] = (
+            df["strengthId"].astype(str) + "_" + df["positionId"].astype(str)
+        )
+    if need_spin_position:
+        df["spinPositionId"] = (
+            df["spinId"].astype(str) + "_" + df["positionId"].astype(str)
+        )
+    if need_strike_action:
+        df["strikeActionId"] = (
+            df["strikeId"].astype(str) + "_" + df["actionId"].astype(str)
+        )
+
+    return df
+
+
+def build_player_role_stats(source_df):
+    source_df = source_df.copy()
+
+    if "serverPlayerId" not in source_df.columns or "receiverPlayerId" not in source_df.columns:
+        source_df = add_role_features(source_df)
+
+    server_rows = source_df[source_df["gamePlayerId"] == source_df["serverPlayerId"]].copy()
+    receiver_rows = source_df[source_df["gamePlayerId"] == source_df["receiverPlayerId"]].copy()
+
+    server_action_top1 = (
+        server_rows.groupby("serverPlayerId")["actionId"]
+        .agg(_mode_top1)
+        .dropna()
+        .to_dict()
+    )
+    server_point_top1 = (
+        server_rows.groupby("serverPlayerId")["pointId"]
+        .agg(_mode_top1)
+        .dropna()
+        .to_dict()
+    )
+    receiver_action_top1 = (
+        receiver_rows.groupby("receiverPlayerId")["actionId"]
+        .agg(_mode_top1)
+        .dropna()
+        .to_dict()
+    )
+    receiver_point_top1 = (
+        receiver_rows.groupby("receiverPlayerId")["pointId"]
+        .agg(_mode_top1)
+        .dropna()
+        .to_dict()
+    )
+
+    global_server_action_top1 = _mode_top1(server_rows["actionId"])
+    if global_server_action_top1 is None:
+        global_server_action_top1 = _mode_top1(source_df["actionId"])
+
+    global_server_point_top1 = _mode_top1(server_rows["pointId"])
+    if global_server_point_top1 is None:
+        global_server_point_top1 = _mode_top1(source_df["pointId"])
+
+    global_receiver_action_top1 = _mode_top1(receiver_rows["actionId"])
+    if global_receiver_action_top1 is None:
+        global_receiver_action_top1 = _mode_top1(source_df["actionId"])
+
+    global_receiver_point_top1 = _mode_top1(receiver_rows["pointId"])
+    if global_receiver_point_top1 is None:
+        global_receiver_point_top1 = _mode_top1(source_df["pointId"])
+
+    rally_role = (
+        source_df.sort_values(["rally_uid", "strikeNumber"])
+        .groupby("rally_uid", as_index=False)
+        .first()[["rally_uid", "serverPlayerId", "receiverPlayerId", "serverGetPoint"]]
+    )
+    rally_role["receiverGetPoint"] = 1.0 - rally_role["serverGetPoint"]
+
+    server_win_rate = rally_role.groupby("serverPlayerId")["serverGetPoint"].mean().to_dict()
+    receiver_win_rate = rally_role.groupby("receiverPlayerId")["receiverGetPoint"].mean().to_dict()
+    server_count = rally_role["serverPlayerId"].value_counts().to_dict()
+    receiver_count = rally_role["receiverPlayerId"].value_counts().to_dict()
+
+    global_server_win_rate = float(rally_role["serverGetPoint"].mean())
+    global_receiver_win_rate = float(rally_role["receiverGetPoint"].mean())
+
+    return {
+        "server_action_top1": server_action_top1,
+        "server_point_top1": server_point_top1,
+        "server_win_rate_bin": {k: bin_rate(v) for k, v in server_win_rate.items()},
+        "server_count_bin": {k: bin_count(v) for k, v in server_count.items()},
+        "receiver_action_top1": receiver_action_top1,
+        "receiver_point_top1": receiver_point_top1,
+        "receiver_win_rate_bin": {k: bin_rate(v) for k, v in receiver_win_rate.items()},
+        "receiver_count_bin": {k: bin_count(v) for k, v in receiver_count.items()},
+        "global_server_action_top1": int(global_server_action_top1),
+        "global_server_point_top1": int(global_server_point_top1),
+        "global_server_win_rate_bin": int(bin_rate(global_server_win_rate)),
+        "global_server_count_bin": 0,
+        "global_receiver_action_top1": int(global_receiver_action_top1),
+        "global_receiver_point_top1": int(global_receiver_point_top1),
+        "global_receiver_win_rate_bin": int(bin_rate(global_receiver_win_rate)),
+        "global_receiver_count_bin": 0,
+    }
+
+
+def apply_player_role_stats_features(df, stats):
+    df = df.copy()
+
+    if "serverPlayerId" not in df.columns or "receiverPlayerId" not in df.columns:
+        df = add_role_features(df)
+
+    server_player = df["serverPlayerId"]
+    receiver_player = df["receiverPlayerId"]
+
+    df["serverPlayerActionTop1"] = server_player.map(stats["server_action_top1"]).fillna(stats["global_server_action_top1"]).astype(np.int64)
+    df["serverPlayerPointTop1"] = server_player.map(stats["server_point_top1"]).fillna(stats["global_server_point_top1"]).astype(np.int64)
+    df["serverPlayerServerWinRateBin"] = server_player.map(stats["server_win_rate_bin"]).fillna(stats["global_server_win_rate_bin"]).astype(np.int64)
+    df["serverPlayerCountBin"] = server_player.map(stats["server_count_bin"]).fillna(0).astype(np.int64)
+
+    df["receiverPlayerActionTop1"] = receiver_player.map(stats["receiver_action_top1"]).fillna(stats["global_receiver_action_top1"]).astype(np.int64)
+    df["receiverPlayerPointTop1"] = receiver_player.map(stats["receiver_point_top1"]).fillna(stats["global_receiver_point_top1"]).astype(np.int64)
+    df["receiverPlayerReceiveWinRateBin"] = receiver_player.map(stats["receiver_win_rate_bin"]).fillna(stats["global_receiver_win_rate_bin"]).astype(np.int64)
+    df["receiverPlayerCountBin"] = receiver_player.map(stats["receiver_count_bin"]).fillna(0).astype(np.int64)
 
     return df
 
@@ -546,15 +973,42 @@ def main(args):
     print("start to run code\n")
     print(f"model seed: {args.seed}")
     print(f"split seed: {args.split_seed}")
-    features = get_features(args.player_feature_mode, args.role_feature_mode, args.player_stats_mode)
+    features = get_features(
+        args.player_feature_mode,
+        args.role_feature_mode,
+        args.player_stats_mode,
+        args.pair_feature_mode,
+        args.player_stats_subset,
+        args.interaction_feature_mode
+    )
     action_feature_idx = features.index("actionId")
     print(f"player_feature_mode={args.player_feature_mode}")
     print(f"role_feature_mode={args.role_feature_mode}")
     print(f"player_stats_mode={args.player_stats_mode}")
+    print(f"player_stats_subset={args.player_stats_subset}")
+    print(f"player_stats_min_count={args.player_stats_min_count}")
+    print(f"pair_feature_mode={args.pair_feature_mode}")
+    print(f"interaction_feature_mode={args.interaction_feature_mode}")
     print("features:", features)
 
+    if args.player_stats_min_count < 0:
+        raise ValueError("player_stats_min_count must be non-negative")
+
     if args.player_stats_mode == "basic":
-        print("Using basic player historical stats.")
+        print("Using basic player historical stats subset:", args.player_stats_subset)
+    elif args.player_stats_mode == "extended":
+        print("Using extended player historical stats.")
+    elif args.player_stats_mode == "role":
+        print("Using role-aware player historical stats.")
+    if args.player_stats_min_count > 0:
+        print(
+            f"Using player stats fallback for players with count < "
+            f"{args.player_stats_min_count}"
+        )
+    if args.pair_feature_mode != "none":
+        print("Using player pair features.")
+    if args.interaction_feature_mode != "none":
+        print("Using interaction features:", args.interaction_feature_mode)
 
     def build_model(action_transition_prior=None):
         return MultiTaskLSTM(
@@ -644,17 +1098,38 @@ def main(args):
     train["strikeNumber"] = train["strikeNumber"].clip(0, 40)
     test["strikeNumber"]  = test["strikeNumber"].clip(0, 40)
 
-    if args.role_feature_mode != "none":
+    need_role_columns = (
+        args.role_feature_mode != "none"
+        or args.player_stats_mode == "role"
+        or args.pair_feature_mode in ["server", "both"]
+    )
+
+    if need_role_columns:
         train = add_role_features(train)
         test = add_role_features(test)
+
+    if args.pair_feature_mode != "none":
+        train = add_pair_features(train, args.pair_feature_mode)
+        test = add_pair_features(test, args.pair_feature_mode)
+
+    if args.interaction_feature_mode != "none":
+        train = add_interaction_features(train, args.interaction_feature_mode)
+        test = add_interaction_features(test, args.interaction_feature_mode)
 
     train_base = train.copy()
     test_base = test.copy()
 
-    if args.player_stats_mode == "basic":
-        temp_player_stats = build_player_stats(train_base)
-        train = apply_player_stats_features(train_base, temp_player_stats)
-        test = apply_player_stats_features(test_base, temp_player_stats)
+    if args.player_stats_mode in ["basic", "extended"]:
+        temp_player_stats = build_player_stats(
+            train_base,
+            min_count=args.player_stats_min_count
+        )
+        train = apply_player_stats_features(train_base, temp_player_stats, mode=args.player_stats_mode)
+        test = apply_player_stats_features(test_base, temp_player_stats, mode=args.player_stats_mode)
+    elif args.player_stats_mode == "role":
+        temp_player_role_stats = build_player_role_stats(train_base)
+        train = apply_player_role_stats_features(train_base, temp_player_role_stats)
+        test = apply_player_role_stats_features(test_base, temp_player_role_stats)
 
     # 把資料換成統一編碼
     # 0 保留給 padding。
@@ -826,13 +1301,23 @@ def main(args):
         val_proc = None if val_df is None else val_df.copy()
         test_proc = None if test_df is None else test_df.copy()
 
-        if args.player_stats_mode == "basic":
-            stats = build_player_stats(fit_df)
-            train_proc = apply_player_stats_features(train_proc, stats)
+        if args.player_stats_mode in ["basic", "extended"]:
+            stats = build_player_stats(
+                fit_df,
+                min_count=args.player_stats_min_count
+            )
+            train_proc = apply_player_stats_features(train_proc, stats, mode=args.player_stats_mode)
             if val_proc is not None:
-                val_proc = apply_player_stats_features(val_proc, stats)
+                val_proc = apply_player_stats_features(val_proc, stats, mode=args.player_stats_mode)
             if test_proc is not None:
-                test_proc = apply_player_stats_features(test_proc, stats)
+                test_proc = apply_player_stats_features(test_proc, stats, mode=args.player_stats_mode)
+        elif args.player_stats_mode == "role":
+            stats = build_player_role_stats(fit_df)
+            train_proc = apply_player_role_stats_features(train_proc, stats)
+            if val_proc is not None:
+                val_proc = apply_player_role_stats_features(val_proc, stats)
+            if test_proc is not None:
+                test_proc = apply_player_role_stats_features(test_proc, stats)
 
         cats_local = {
             c: np.sort(train_proc[c].dropna().unique())
@@ -1847,7 +2332,42 @@ if __name__ == "__main__":
     )
     ap.add_argument(
         "--player_stats_mode",
-        choices=["none", "basic"],
+        choices=["none", "basic", "role", "extended"],
+        default="none"
+    )
+    ap.add_argument(
+        "--player_stats_subset",
+        choices=[
+            "all",
+            "top1",
+            "rate",
+            "count",
+            "current_only",
+            "other_only",
+            "no_count",
+            "no_rate",
+        ],
+        default="all"
+    )
+    ap.add_argument("--player_stats_min_count", type=int, default=0)
+    ap.add_argument(
+        "--pair_feature_mode",
+        choices=["none", "current", "server", "both"],
+        default="none"
+    )
+    ap.add_argument(
+        "--interaction_feature_mode",
+        choices=[
+            "none",
+            "action_strength",
+            "action_position",
+            "action_spin",
+            "strength_position",
+            "spin_position",
+            "strike_action",
+            "basic",
+            "full",
+        ],
         default="none"
     )
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)

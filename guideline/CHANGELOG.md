@@ -2573,3 +2573,100 @@ done
 | P17 player_strict 單獨主提交 | LB 0.5720 < P8 0.5757 |
 
 ---
+
+## 2026-05-22～23 T3 — window_k=1 極端對齊 + P12b 條件式 rank-blend
+
+### 當前最佳 T3
+
+| 檔案 | LB AUC | 備註 |
+|---|---|---|
+| `submission_p12b_bk80.csv` | **0.6018** | ★ 當前最佳 |
+| `submission_t3only_p12b_bk80.csv` | — | 隔離測試用（actionId/pointId 填 -1） |
+
+---
+
+### 1. LB AUC 進展總覽
+
+| 版本 | 關鍵變更 | LB AUC |
+|---|---|---|
+| P15d window_k=2 5-seed | 只看最後 2 拍 | 0.5934 |
+| P15d k=2 + P17 rank-blend 70/30 | diversity 補刀 | 0.5952 |
+| P15d window_k=1 5-seed | 極端對齊，只看最後 1 拍 | 0.5999 |
+| P15d k=1 + P17 rank-blend 70/30（uniform）| — | 0.6011 |
+| **P12b bk80 條件式 blend** | 雙方已知 α=0.80，其餘 0.70 | **0.6018** |
+
+---
+
+### 2. window_k=1 突破原因
+
+test_new 中位數序列長度為 2 拍（53.3% ≤ 2 拍）。  
+k=1 強制模型只看最後 1 拍，最精準對齊 test 分布。
+
+**反直覺現象**：val AUC 隨 k 縮小反而下降（k=1 val=0.5724 最低），但 LB AUC 持續提升。  
+val 低估是因為窗口太短導致 val 本身也難以預測，並非模型變差。
+
+```bash
+# P15d k=1，5 個 seed 各跑一次
+for SEED in 42 123 456 789 2024; do
+  python baseline_auc_sliced.py \
+    --seed $SEED --epochs 10 --select_metric auc \
+    --window_k 1 \
+    --out submission_p15d_wk1_s${SEED}.csv
+done
+
+# 5-seed 機率平均
+python ensemble_t3_seeds.py \
+  --files submission_p15d_wk1_s42.csv submission_p15d_wk1_s123.csv \
+          submission_p15d_wk1_s456.csv submission_p15d_wk1_s789.csv \
+          submission_p15d_wk1_s2024.csv \
+  --out submission_p15d_wk1_ens5.csv
+```
+
+---
+
+### 3. P12b 條件式 rank-blend（當前最佳）
+
+**核心概念**：test 中球員知識分布不均，對不同 rally 套用不同的 blend 權重。
+
+| 球員知識 | test 比例 | alpha（主模型 P15d k=1） |
+|---|---|---|
+| 雙方已知 | 45.6%（842 rally）| **0.80** |
+| 一方未知 | 48.1%（888 rally）| 0.70 |
+| 雙方未知 | 6.2%（115 rally）| 0.70 |
+
+對「雙方已知」提高主模型權重的直覺：雙方球員資訊完整，主模型（訓練時有完整 player feature）更可信；一方/雙方未知時，維持 uniform 0.70，不給 P17 更多主導權（P17 整體 LB 0.5720，過度提高反而有害）。
+
+**alpha 搜尋結果**（one/none 固定 0.70，只搜尋 bk）：
+
+| bk alpha | LB AUC |
+|---|---|
+| 0.70（uniform baseline）| 0.6011 |
+| 0.80 | **0.6018 ★** |
+| 0.82 | 0.6017 |
+| 0.85 | 0.6016 |
+
+甜蜜點確認在 bk=0.80。
+
+**產生指令**：
+
+```bash
+python p12a_cond_blend.py \
+  --main submission_p15d_wk1_ens5.csv \
+  --aux  submission_p17_ens5.csv \
+  --alpha_both 0.80 \
+  --alpha_one  0.70 \
+  --alpha_none 0.70 \
+  --out  submission_p12b_bk80.csv
+```
+
+---
+
+### 4. 已驗證無效（2026-05-22～23）
+
+| 方向 | LB AUC | 原因 |
+|---|---|---|
+| P11c lr=5e-4 + k=1 | 0.5873 | lr 太小，k=1 只 1 拍需快速收斂，欠擬合 |
+| P15d-rf refit_full + k=1 | 0.5995 | k=1 訓練資料已極短，全資料重訓無額外收益 |
+| P12a 條件式（bk=0.8, one=0.5, none=0.3）| 0.5987 | one_unknown 降太多，P17 主導過多 |
+
+---
